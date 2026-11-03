@@ -22,7 +22,9 @@ macOS releases is not promised. Other systems are not yet supported. Use the *wh
 in =prebuilt/PLATFORM/= next to =lispm-auth.el=, or set =lispm-auth-service-program= to an absolute
 local executable filename. The resolver never searches PATH or launches a Lisp interpreter.
 
-=lispm-auth-install-service= is the explicit download/install command. It uses the fixed
+=lispm-auth-install-service= requires an Emacs build with zlib support
+(=zlib-decompress-region=); SVG support is not required for terminal operation or headless tests.
+It is the explicit download/install command. It uses the fixed
 =lispm-auth-service-version= and a SHA256 pin in =lispm-auth-service-sha256=, verifies the archive
 before extraction, rejects links and unsafe paths, probes the executable, then activates a new
 versioned directory atomically. Existing installations are not overwritten. Merely loading the

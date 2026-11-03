@@ -28,20 +28,33 @@ jobs:
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install ecl libsodium
+          brew install ecl libsodium pkgconf
           echo "SODIUM_PREFIX=$(brew --prefix libsodium)" >> "$GITHUB_ENV"
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ecl libecl-dev libgc-dev libgmp-dev libffi-dev libsodium-dev patchelf pkg-config
+          sudo apt-get install -y ecl libecl-dev libgc-dev libgmp-dev libffi-dev libsodium-dev patchelf pkg-config build-essential libncurses-dev zlib1g-dev
           mkdir -p build/sodium/lib build/sodium/include
           cp /usr/lib/x86_64-linux-gnu/libsodium.a build/sodium/lib/
           cp -R /usr/include/sodium /usr/include/sodium.h build/sodium/include/
           echo "SODIUM_PREFIX=$PWD/build/sodium" >> "$GITHUB_ENV"
-      - uses: purcell/setup-emacs@master
-        with:
-          version: '30.1'
+      # Build the supported minimum with zlib. Headless CI does not need SVG.
+      # Avoid moving Nixpkgs inputs which no longer support Intel macOS.
+      - name: Build Emacs 30.1 with zlib
+        shell: bash
+        run: |
+          curl --fail --location --retry 3 https://ftp.gnu.org/gnu/emacs/emacs-30.1.tar.xz -o "$RUNNER_TEMP/emacs.tar.xz"
+          tar -xf "$RUNNER_TEMP/emacs.tar.xz" -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/emacs-30.1"
+          ./configure --prefix="$RUNNER_TEMP/emacs" --without-x --without-ns \
+            --without-native-compilation --without-tree-sitter --without-dbus \
+            --without-sound --without-pop --without-mailutils --without-compress-install
+          make -j3
+          make install
+          "$RUNNER_TEMP/emacs/bin/emacs" -Q --batch \
+            --eval '(unless (fboundp (quote zlib-decompress-region)) (error "CI Emacs needs zlib"))'
+          echo "$RUNNER_TEMP/emacs/bin" >> "$GITHUB_PATH"
       - name: Build and test sources
         run: |
           make service

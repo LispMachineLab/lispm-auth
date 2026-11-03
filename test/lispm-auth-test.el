@@ -30,6 +30,21 @@
 (require 'cl-lib)
 (require 'lispm-auth)
 
+;; Layout tests simulate graphical displays in headless Emacs. Test the SVG
+;; data/layout without requiring a renderer; actual image rendering is manual.
+(defvar lispm-auth-test--create-image (symbol-function 'create-image))
+(defun lispm-auth-test--image (data type &rest properties)
+  "Represent SVG DATA in headless tests, otherwise use the real renderer."
+  (if (eq type 'svg)
+      (list 'image :type type :data data)
+    (apply lispm-auth-test--create-image data type properties)))
+
+(ert-deftest lispm-auth-test-svg-construction-without-renderer ()
+  (let ((lispm-auth-test--create-image (lambda (&rest _) (ert-fail "Unexpected renderer"))))
+    (cl-letf (((symbol-function 'create-image) #'lispm-auth-test--image))
+      (should (eq (car (lispm-auth--page-field-image '(:password ""))) 'image)))))
+
+
 ;; LispM's own, in lispm-core.el; dynamic here so a test may give the
 ;; migration backends of its own.
 (defvar lispm-backends)
@@ -1145,7 +1160,8 @@ away, and its windows come back with the page."
                      :slide nil :window-configuration nil))
          (shown nil) (parameters nil) (configuration nil)
          (deleted nil) (made nil))
-    (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _) t))
+    (cl-letf (((symbol-function 'create-image) #'lispm-auth-test--image)
+              ((symbol-function 'display-graphic-p) (lambda (&optional _) t))
               ((symbol-function 'selected-frame) (lambda () 'lispm-frame))
               ((symbol-function 'selected-window) (lambda () 'lispm-window))
               ((symbol-function 'window-minibuffer-p) #'ignore)
@@ -1215,7 +1231,8 @@ centres; the block starts above the middle, as a title page does."
         (progn
           (with-current-buffer buffer (lispm-auth-page-mode))
           (setf (plist-get page :buffer) buffer)
-          (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _) t))
+          (cl-letf (((symbol-function 'create-image) #'lispm-auth-test--image)
+                    ((symbol-function 'display-graphic-p) (lambda (&optional _) t))
                     ((symbol-function 'frame-live-p)
                      (lambda (frame) (eq frame 'page-frame)))
                     ((symbol-function 'lispm-auth--page-logo-image)
@@ -1263,7 +1280,8 @@ that way too, and asks for the old password before a change as well."
         (lispm-auth-test--page-shows nil)
         (lispm-auth-test--page-texts nil)
         (lispm-auth-test--page-buffer nil))
-    (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _) t)))
+    (cl-letf (((symbol-function 'create-image) #'lispm-auth-test--image)
+              ((symbol-function 'display-graphic-p) (lambda (&optional _) t)))
       (should (equal (lispm-auth--page-read "New LispM password: " t nil)
                      "one"))
       ;; Both entries of the new password, and the empty field the second
@@ -1302,7 +1320,8 @@ page."
          (lispm-auth-page-window-draw-function #'ignore)
          (shown nil) (redrawn nil) (parameters nil) (configuration nil)
          (deleted nil) (made nil))
-    (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _) t))
+    (cl-letf (((symbol-function 'create-image) #'lispm-auth-test--image)
+              ((symbol-function 'display-graphic-p) (lambda (&optional _) t))
               ((symbol-function 'selected-frame) (lambda () 'lispm-frame))
               ((symbol-function 'selected-window) (lambda () 'lispm-window))
               ((symbol-function 'window-minibuffer-p) #'ignore)
@@ -1366,7 +1385,8 @@ application opened on its own starts LispM, and hides it with the page."
          (lispm-auth-page-windowed t)
          (lispm-auth-page-window-draw-function #'ignore)
          (parameters nil))
-    (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _) t))
+    (cl-letf (((symbol-function 'create-image) #'lispm-auth-test--image)
+              ((symbol-function 'display-graphic-p) (lambda (&optional _) t))
               ((symbol-function 'selected-frame) (lambda () 'lispm-frame))
               ((symbol-function 'selected-window) (lambda () 'lispm-window))
               ((symbol-function 'window-minibuffer-p) #'ignore)
@@ -1417,7 +1437,8 @@ application opened on its own starts LispM, and hides it with the page."
         (progn
           (with-current-buffer buffer (lispm-auth-page-mode))
           (setf (plist-get page :buffer) buffer)
-          (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _) t))
+          (cl-letf (((symbol-function 'create-image) #'lispm-auth-test--image)
+                    ((symbol-function 'display-graphic-p) (lambda (&optional _) t))
                     ((symbol-function 'frame-live-p)
                      (lambda (frame) (eq frame 'page-frame)))
                     ((symbol-function 'lispm-auth--page-logo-image)
@@ -1454,7 +1475,8 @@ gone, so that nothing drifts across the page behind it."
         (progn
           (with-current-buffer buffer (lispm-auth-page-mode))
           (setf (plist-get page :buffer) buffer)
-          (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _) t))
+          (cl-letf (((symbol-function 'create-image) #'lispm-auth-test--image)
+                    ((symbol-function 'display-graphic-p) (lambda (&optional _) t))
                     ((symbol-function 'frame-live-p)
                      (lambda (frame) (eq frame 'page-frame)))
                     ((symbol-function 'lispm-auth--page-logo-image)
