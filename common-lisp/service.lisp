@@ -1,37 +1,36 @@
 ;;; One request per process. Binary fields are hex; passwords are UTF-8 bytes.
-;; Do not emit diagnostics that might contain input or backtraces.
-(setf *error-output* (make-broadcast-stream)
-      *trace-output* (make-broadcast-stream)
-      sb-ext:*invoke-debugger-hook* (lambda (condition hook)
-                                      (declare (ignore condition hook))
-                                      (sb-ext:exit :code 1)))
-(require :asdf)
-(let ((*standard-output* (make-broadcast-stream))
-      (*trace-output* (make-broadcast-stream)))
-  (asdf:load-system :cffi))
+(defpackage #:lispm-auth-service (:use #:cl) (:export #:main))
+(in-package #:lispm-auth-service)
 
-(cffi:define-foreign-library libsodium
-  (:darwin (:or "libsodium.dylib" "/opt/homebrew/lib/libsodium.dylib" "/usr/local/lib/libsodium.dylib"))
-  (:unix (:or "libsodium.so" "libsodium.so.23"))
-  (t (:default "libsodium")))
-(cffi:use-foreign-library libsodium)
-(cffi:defctype size-t #+64-bit :uint64 #-64-bit :uint32)
-(cffi:defcfun ("sodium_init" sodium-init) :int)
-(cffi:defcfun ("randombytes_buf" randombytes-buf) :void (buf :pointer) (size size-t))
-(cffi:defcfun ("sodium_memzero" sodium-memzero) :void (buf :pointer) (size size-t))
-(cffi:defcfun ("crypto_pwhash" pwhash) :int
-  (out :pointer) (outlen :unsigned-long-long) (passwd :pointer)
-  (passwdlen :unsigned-long-long) (salt :pointer) (opslimit :unsigned-long-long)
-  (memlimit size-t) (alg :int))
-(cffi:defcfun ("crypto_aead_xchacha20poly1305_ietf_encrypt" sodium-encrypt) :int
-  (out :pointer) (outlen :pointer) (msg :pointer) (msglen :unsigned-long-long)
-  (aad :pointer) (aadlen :unsigned-long-long) (nsec :pointer) (nonce :pointer) (key :pointer))
-(cffi:defcfun ("crypto_aead_xchacha20poly1305_ietf_decrypt" sodium-decrypt) :int
-  (out :pointer) (outlen :pointer) (nsec :pointer) (cipher :pointer)
-  (cipherlen :unsigned-long-long) (aad :pointer) (aadlen :unsigned-long-long)
-  (nonce :pointer) (key :pointer))
-
-(unless (>= (sodium-init) 0) (error "libsodium initialization failed"))
+;; Extract checked foreign-data pointers explicitly at the static FFI boundary.
+(ffi:clines "#include <sodium.h>" "#include <string.h>")
+(defun sodium-init ()
+  (ffi:c-inline () () :int "sodium_init()" :one-liner t))
+(defun randombytes-buf (p n)
+  (ffi:c-inline (p n) (:object :unsigned-long) :void
+    "randombytes_buf(ecl_to_pointer(#0), #1);" :one-liner t))
+(defun sodium-memzero (p n)
+  (ffi:c-inline (p n) (:object :unsigned-long) :void
+    "sodium_memzero(ecl_to_pointer(#0), #1);" :one-liner t))
+(defun pwhash (out outlen password passwordlen salt ops mem alg)
+  (ffi:c-inline (out outlen password passwordlen salt ops mem alg)
+      (:object :unsigned-long-long :object :unsigned-long-long :object
+       :unsigned-long-long :unsigned-long :int) :int
+    "crypto_pwhash(ecl_to_pointer(#0), #1, ecl_to_pointer(#2), #3, ecl_to_pointer(#4), #5, #6, #7)"
+    :one-liner t))
+(defun sodium-encrypt (out outlen msg msglen aad aadlen nonce key)
+  (ffi:c-inline (out outlen msg msglen aad aadlen nonce key)
+      (:object :object :object :unsigned-long-long :object :unsigned-long-long :object :object) :int
+    "crypto_aead_xchacha20poly1305_ietf_encrypt(ecl_to_pointer(#0), ecl_to_pointer(#1), ecl_to_pointer(#2), #3, ecl_to_pointer(#4), #5, NULL, ecl_to_pointer(#6), ecl_to_pointer(#7))"
+    :one-liner t))
+(defun sodium-decrypt (out outlen cipher cipherlen aad aadlen nonce key)
+  (ffi:c-inline (out outlen cipher cipherlen aad aadlen nonce key)
+      (:object :object :object :unsigned-long-long :object :unsigned-long-long :object :object) :int
+    "crypto_aead_xchacha20poly1305_ietf_decrypt(ecl_to_pointer(#0), ecl_to_pointer(#1), NULL, ecl_to_pointer(#2), #3, ecl_to_pointer(#4), #5, ecl_to_pointer(#6), ecl_to_pointer(#7))"
+    :one-liner t))
+(defun foreign-length (p)
+  (ffi:c-inline (p) (:object) :unsigned-long-long
+    "*(unsigned long long *)ecl_to_pointer(#0)" :one-liner t))
 
 ;; All allocated foreign buffers are tracked and wiped even on authentication failure.
 (define-condition invalid-request (error) ())
@@ -43,14 +42,18 @@
   (let ((v (make-array n :element-type '(unsigned-byte 8) :initial-element 0)))
     (push v *arrays*) v))
 (defun foreign-buffer (n)
-  (let ((p (cffi:foreign-alloc :uint8 :count (max 1 n))))
+  (let ((p (ffi:allocate-foreign-object :byte (max 1 n))))
     (push (cons p (max 1 n)) *buffers*) p))
 (defun foreign-bytes (v)
   (let ((p (foreign-buffer (length v))))
-    (loop for b across v for i from 0 do (setf (cffi:mem-aref p :uint8 i) b)) p))
+    (ffi:c-inline (v p) (:object :object) :void
+      "memcpy(ecl_to_pointer(#1), #0->vector.self.b8, #0->vector.dim);" :one-liner t)
+    p))
 (defun from-foreign (p n)
   (let ((v (bytes n)))
-    (dotimes (i n v) (setf (aref v i) (cffi:mem-aref p :uint8 i)))))
+    (ffi:c-inline (p v) (:object :object) :void
+      "memcpy(#1->vector.self.b8, ecl_to_pointer(#0), #1->vector.dim);" :one-liner t)
+    v))
 (defun join-bytes (&rest vectors)
   (let ((v (bytes (reduce #'+ vectors :key #'length))) (i 0))
     (dolist (part vectors v) (replace v part :start1 i) (incf i (length part)))))
@@ -86,12 +89,12 @@
          (aadp (foreign-bytes aad)) (inp (foreign-bytes input))
          (result (if encrypt
                      (sodium-encrypt out outlen inp (length input) aadp (length aad)
-                                     (cffi:null-pointer) noncep keyp)
-                     (sodium-decrypt out outlen (cffi:null-pointer) inp (length input)
+                                     noncep keyp)
+                     (sodium-decrypt out outlen inp (length input)
                                      aadp (length aad) noncep keyp))))
     (unless (zerop result)
       (if encrypt (error "encryption failed") (error 'authentication-failure)))
-    (unless (= len (cffi:mem-ref outlen :unsigned-long-long))
+    (unless (= len (foreign-length outlen))
       (error "unexpected output length"))
     (from-foreign out len)))
 (defun check-key (key) (unless (= (length key) 32) (error 'invalid-request)))
@@ -148,19 +151,27 @@
                     (error 'invalid-request))
                    (t (setf (char buffer i) ch))))))
 
-(let ((*buffers* nil) (*arrays* nil) (*strings* nil) (line nil) (response nil))
-  (unwind-protect
-       (handler-case
-           (progn
-             (setf line (bounded-line))
-             (setf response (hex (process-request line)))
-             (format t "ok~c~a~%" #\Tab response)
-             (finish-output))
-         (invalid-request () (format t "error~cinvalid~%" #\Tab) (finish-output))
-         (authentication-failure () (format t "error~cauth~%" #\Tab) (finish-output))
-         (error () (format t "error~cinternal~%" #\Tab) (finish-output)))
-    (dolist (entry *buffers*) (sodium-memzero (car entry) (cdr entry)) (cffi:foreign-free (car entry)))
-    (dolist (array *arrays*) (fill array 0))
-    (dolist (string *strings*) (fill string #\Null))
-    (when line (fill line #\Null))
-    (when response (fill response #\Null))))
+(defun main ()
+  (setf *error-output* (make-broadcast-stream)
+        *trace-output* (make-broadcast-stream)
+        *debugger-hook* (lambda (condition hook)
+                         (declare (ignore condition hook)) (ext:quit 1)))
+  (unless (>= (sodium-init) 0) (ext:quit 1))
+  (let ((*buffers* nil) (*arrays* nil) (*strings* nil) (line nil) (response nil))
+    (unwind-protect
+         (handler-case
+             (progn
+               (setf line (bounded-line))
+               (setf response (hex (process-request line)))
+               (format t "ok~c~a~%" #\Tab response)
+               (finish-output))
+           (invalid-request () (format t "error~cinvalid~%" #\Tab) (finish-output))
+           (authentication-failure () (format t "error~cauth~%" #\Tab) (finish-output))
+           (error () (format t "error~cinternal~%" #\Tab) (finish-output)))
+      (dolist (entry *buffers*)
+        (sodium-memzero (car entry) (cdr entry))
+        (ffi:free-foreign-object (car entry)))
+      (dolist (array *arrays*) (fill array 0))
+      (dolist (string *strings*) (fill string #\Null))
+      (when line (fill line #\Null))
+      (when response (fill response #\Null)))))

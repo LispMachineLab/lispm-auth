@@ -1,0 +1,38 @@
+{
+  "ecl": {
+    "name": "Embeddable Common Lisp",
+    "license": "LGPL-2.1-or-later (see upstream copyright exceptions)",
+    "source": "https://ecl.common-lisp.dev/static/files/release/ecl-{version}.tgz",
+    "licenses": ["COPYING", "LICENSE", "src/lsp/loop.lsp", "src/lsp/pprint.lsp", "src/lsp/format.lsp"],
+    "sha256": {"26.5.5": "a01a5bcda8c5b73e59dda3494fd13e5fec5db6aa1dad782c3cc3bb57f1633435"}
+  },
+  "gmp": {
+    "name": "GNU MP",
+    "license": "LGPL-3.0-or-later OR GPL-2.0-or-later",
+    "source": "https://ftp.gnu.org/gnu/gmp/gmp-{version}.tar.xz",
+    "licenses": ["COPYING.LESSERv3", "COPYINGv2", "COPYINGv3"],
+    "sha256": {"6.3.0": "a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898"}
+  },
+  "bdw-gc": {
+    "name": "Boehm-Demers-Weiser conservative garbage collector",
+    "license": "Boehm-GC AND HPND-sell-variant (permissive; see upstream copyright notices)",
+    "source": "https://github.com/bdwgc/bdwgc/releases/download/v{version}/gc-{version}.tar.gz",
+    "licenses": ["README.md", "include/gc_allocator.h"],
+    "sha256": {"8.2.12": "42e5194ad06ab6ffb806c83eb99c03462b495d979cda782f3c72c08af833cd4e"}
+  },
+  "libsodium": {
+    "name": "libsodium (including the statically linked service copy)",
+    "license": "ISC",
+    "source": "https://download.libsodium.org/libsodium/releases/libsodium-{version}.tar.gz",
+    "source_overrides": {"1.0.18": "https://download.libsodium.org/libsodium/releases/old/libsodium-1.0.18.tar.gz"},
+    "licenses": ["LICENSE"],
+    "sha256": {"1.0.22": "adbdd8f16149e81ac6078a03aca6fc03b592b89ef7b5ed83841c086191be3349"}
+  },
+  "libffi": {
+    "name": "libffi (when bundled, not the macOS system copy)",
+    "license": "MIT",
+    "source": "https://github.com/libffi/libffi/releases/download/v{version}/libffi-{version}.tar.gz",
+    "licenses": ["LICENSE"],
+    "sha256": {}
+  }
+}

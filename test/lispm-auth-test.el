@@ -19,10 +19,10 @@
 
 ;;; Commentary:
 
-;; The tests run GnuPG itself, each store in a directory of its own, and
-;; answer the password from a variable instead of a prompt: nothing is
-;; written outside the temporary directory, and no passphrase is asked
-;; for.  They are skipped where GnuPG is not installed.
+;; Integration tests run the standalone service named by LISPM_AUTH_SERVICE,
+;; each store in its own temporary directory.  Passwords come from a
+;; variable, not a prompt.  No encryption command-line tool is required.
+;; Without LISPM_AUTH_SERVICE the integration tests are skipped.
 
 ;;; Code:
 
@@ -91,8 +91,8 @@
       (kill-buffer buffer))
     (setq lispm-auth-test--page-buffer nil)))
 
-(defconst lispm-auth-test--gpg (executable-find "gpg")
-  "The GnuPG the tests run, or nil.")
+(defconst lispm-auth-test--service (getenv "LISPM_AUTH_SERVICE")
+  "Standalone service executable supplied by the test build.")
 
 (defmacro lispm-auth-test--with-store (&rest body)
   "Run BODY with a store, and a prompt, of its own."
@@ -117,12 +117,15 @@
        (when (file-directory-p lispm-auth-directory)
          (delete-directory lispm-auth-directory t)))))
 
-(defmacro lispm-auth-test--unless-gpg (&rest body)
-  "Run BODY unless GnuPG is missing, in which case skip the test."
+(defmacro lispm-auth-test--with-service (&rest body)
+  "Run BODY with the standalone test service, or skip when none was supplied.
+An explicitly supplied but invalid executable is an error, not a skip."
   (declare (indent 0))
-  `(if lispm-auth-test--gpg
-       (progn ,@body)
-     (ert-skip "GnuPG is not installed")))
+  `(let ((lispm-auth-service-program lispm-auth-test--service))
+     (unless lispm-auth-service-program
+       (ert-skip "LISPM_AUTH_SERVICE is not set"))
+     (lispm-auth--service-program)
+     ,@body))
 
 (defun lispm-auth-test--make-store (password &rest secrets)
   "Make a store with PASSWORD holding SECRETS, pairs of ID and secret."
@@ -149,7 +152,9 @@
 (defmacro lispm-auth-test--fake-service (code &rest body)
   "Run BODY with a Python process emitting CODE instead of the service."
   (declare (indent 1))
-  `(let ((original (symbol-function 'make-process)))
+  `(let ((original (symbol-function 'make-process))
+         (lispm-auth-service-program
+          (or (executable-find "python3") (ert-skip "Python unavailable"))))
      (cl-letf (((symbol-function 'make-process)
                 (lambda (&rest args)
                   (setq args (plist-put args :command
@@ -158,6 +163,67 @@
                                               "-c" ,code)))
                   (apply original args))))
        ,@body)))
+
+(ert-deftest lispm-auth-test-service-resolver-explicit-path ()
+  "Only an absolute local executable can be explicitly selected."
+  (let ((lispm-auth-service-program (or (executable-find "python3")
+                                        (ert-skip "Python unavailable"))))
+    (should (equal (lispm-auth--service-program) lispm-auth-service-program)))
+  (dolist (program '("sh" "./lispm-auth-service" "/no-such-service" ""))
+    (let ((lispm-auth-service-program program))
+      (should-error (lispm-auth--service-program) :type 'lispm-auth-unavailable))))
+
+(ert-deftest lispm-auth-test-service-resolver-package-artifact ()
+  "The default resolves only the packaged executable for this platform."
+  (let ((lispm-auth-service-program nil)
+        (lispm-auth--package-directory
+         (file-name-as-directory (make-temp-file "lispm-auth-package-" t))))
+    (unwind-protect
+        (let* ((platform (lispm-auth--service-platform))
+               (file (and platform (expand-file-name
+                                    (concat "prebuilt/" platform "/lispm-auth-service")
+                                    lispm-auth--package-directory))))
+          (should-error (lispm-auth--service-program) :type 'lispm-auth-unavailable)
+          (when platform
+            (make-directory (file-name-directory file) t)
+            (with-temp-file file (insert "#!/bin/sh\nexit 0\n"))
+            (should-error (lispm-auth--service-program) :type 'lispm-auth-unavailable)
+            (set-file-modes file #o700)
+            (should (equal (lispm-auth--service-program) file))))
+      (delete-directory lispm-auth--package-directory t))))
+
+(ert-deftest lispm-auth-test-service-resolver-unsupported-platform ()
+  (let ((lispm-auth-service-program nil)
+        (system-type 'windows-nt))
+    (should-not (lispm-auth--service-platform))
+    (should-error (lispm-auth--service-program) :type 'lispm-auth-unavailable))
+  (let ((system-type 'gnu/linux)
+        (system-configuration "aarch64-unknown-linux-gnu"))
+    (should-not (lispm-auth--service-platform))))
+
+(ert-deftest lispm-auth-test-legacy-store-rejected-without-overwriting ()
+  "Old stores cannot become a new store, regardless of the chosen action."
+  (dolist (name '("secrets.gpg" "key.gpg" "secrets"))
+    (lispm-auth-test--with-store
+      (let ((file (expand-file-name name lispm-auth-directory)))
+        (if (equal name "secrets")
+            (make-directory file)
+          (let ((file-name-handler-alist nil))
+            (with-temp-file file (insert "old encrypted data"))))
+        (should (lispm-auth-store-exists-p))
+        (should-error (lispm-auth-unlock) :type 'lispm-auth-error)
+        (should-error (lispm-auth-change-password "new") :type 'lispm-auth-error)
+        (should-not lispm-auth-test--prompts)
+        (should-not (file-exists-p (lispm-auth-key-file)))
+        (should (if (file-directory-p file) (file-directory-p file)
+                  (equal (lispm-auth-test--file-bytes file) "old encrypted data")))))))
+
+(ert-deftest lispm-auth-test-incomplete-native-store-rejected ()
+  (lispm-auth-test--with-store
+    (make-directory (expand-file-name "native/items" lispm-auth-directory) t)
+    (should-error (lispm-auth-unlock) :type 'lispm-auth-error)
+    (should-not lispm-auth-test--prompts)
+    (should-not (file-exists-p (lispm-auth-key-file)))))
 
 (ert-deftest lispm-auth-test-service-framing-and-limits ()
   (dolist (response '("ok\t00\nextra" "ok\t0\n" "ok\tXX\n" "ok\t00" "error\nextra"))
@@ -179,11 +245,13 @@
     (should-error (lispm-auth--read-data-key "password") :type 'lispm-auth-error)
     (lispm-auth--write-ciphertext (concat "4c415701" (make-string 176 ?0))
                                   (lispm-auth-key-file))
-    (let ((lispm-auth-lisp-program "no-such-lisp-executable"))
+    (let ((lispm-auth-service-program "/no-such-service-executable"))
       (should-error (lispm-auth--read-data-key "password") :type 'lispm-auth-unavailable))))
 
 (ert-deftest lispm-auth-test-service-quit-cleans-processes ()
-  (let ((original (symbol-function 'make-process)) (child nil))
+  (let ((original (symbol-function 'make-process)) (child nil)
+        (lispm-auth-service-program
+         (or (executable-find "python3") (ert-skip "Python unavailable"))))
     (cl-letf (((symbol-function 'make-process)
                (lambda (&rest args)
                  (setq args (plist-put args :command
@@ -198,7 +266,7 @@
 
 (ert-deftest lispm-auth-test-native-tamper-and-id-binding ()
   (lispm-auth-test--with-store
-    (let ((lispm-auth-gpg-program "not-installed"))
+    (lispm-auth-test--with-service
       (lispm-auth-test--make-store "hunter2" (cons "one" "sëcret") (cons "two" "other"))
       (let* ((one (lispm-auth--item-file "one"))
              (two (lispm-auth--item-file "two"))
@@ -212,37 +280,11 @@
       (setq lispm-auth-test--answers '("hunter2"))
       (should (lispm-auth-unlock)))))
 
-(ert-deftest lispm-auth-test-keyed-legacy-migration-and-failure ()
-  (lispm-auth-test--unless-gpg
-    (lispm-auth-test--with-store
-      (let* ((old-key (make-string 64 ?a))
-             (key-file (expand-file-name "key.gpg" lispm-auth-directory))
-             (items (expand-file-name "secrets" lispm-auth-directory))
-             (item (expand-file-name (concat (secure-hash 'sha256 "id") ".gpg") items)))
-        (make-directory items)
-        (lispm-auth--write-ciphertext (lispm-auth--encrypt old-key "hunter2") key-file)
-        (lispm-auth--write-ciphertext (lispm-auth--encrypt-with (prin1-to-string '("id" . "secret")) old-key) item)
-        (let ((original (lispm-auth-test--file-bytes item)))
-          (should-error (lispm-auth--open "wrong") :type 'lispm-auth-wrong-password)
-          (cl-letf (((symbol-function 'lispm-auth--write-data-key) (lambda (&rest _) (error "failure"))))
-            (should-error (lispm-auth--open "hunter2")))
-          (should-not (file-exists-p (lispm-auth-key-file)))
-          (should (equal original (lispm-auth-test--file-bytes item)))
-          (setq lispm-auth-test--answers '("hunter2"))
-          (should (lispm-auth-unlock))
-          (should (equal (lispm-auth--get "id") "secret"))
-          (should (equal original (lispm-auth-test--file-bytes item)))
-          (lispm-auth-lock)
-          (let ((lispm-auth-gpg-program "not-installed"))
-            (setq lispm-auth-test--answers '("hunter2"))
-            (should (lispm-auth-unlock))
-            (should (equal (lispm-auth--get "id") "secret"))))))))
-
 ;;;; Keeping secrets
 
 (ert-deftest lispm-auth-test-round-trip ()
   "A secret stored comes back after the store is locked again."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-test--make-store "hunter2"
                                    (cons "first" "sk-first")
@@ -263,7 +305,7 @@
 
 (ert-deftest lispm-auth-test-nothing-in-plaintext-on-disk ()
   "Neither the secrets nor the password are written in plaintext."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-test--make-store "hunter2"
                                    (cons "openai" "sk-do-not-write-me-down"))
@@ -273,7 +315,7 @@
 
 (ert-deftest lispm-auth-test-wrong-password-leaves-the-file-intact ()
   "A wrong password opens nothing, and the store stays as it was."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-test--make-store "hunter2" (cons "id" "sk-secret"))
       (let ((before (lispm-auth-test--file-bytes (lispm-auth-key-file))))
@@ -290,7 +332,7 @@
 
 (ert-deftest lispm-auth-test-wrong-password-then-right ()
   "A wrong password asks again, and the right one opens the store."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-test--make-store "hunter2" (cons "id" "sk-secret"))
       (lispm-auth-lock)
@@ -302,7 +344,7 @@
 
 (ert-deftest lispm-auth-test-cancelled-password-opens-nothing ()
   "Giving no password opens nothing, and says nothing is wrong."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-test--make-store "hunter2" (cons "id" "sk-secret"))
       (lispm-auth-lock)
@@ -312,7 +354,7 @@
 
 (ert-deftest lispm-auth-test-failed-write-leaves-the-store ()
   "A write that fails leaves the previous secret as it was."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-test--make-store "hunter2" (cons "id" "sk-secret"))
       (let ((before (lispm-auth-test--file-bytes
@@ -327,7 +369,7 @@
 
 (ert-deftest lispm-auth-test-delete ()
   "A secret deleted is gone, and deleting one never there answers nil."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-test--make-store "hunter2"
                                    (cons "one" "sk-one")
@@ -344,7 +386,7 @@
 
 (ert-deftest lispm-auth-test-lock-forgets ()
   "Locking forgets the data key, and nothing of the store is left in memory."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-test--make-store "hunter2" (cons "id" "sk-secret"))
       (lispm-auth-lock)
@@ -355,7 +397,7 @@
 
 (ert-deftest lispm-auth-test-one-file-per-secret ()
   "Each secret is a file of its own, named for its ID, not one store file."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-test--make-store "hunter2"
                                    (cons "one" "sk-one")
@@ -364,12 +406,12 @@
       (should (file-exists-p (lispm-auth--item-file "two")))
       (should-not (equal (lispm-auth--item-file "one")
                          (lispm-auth--item-file "two")))
-      (should-not (file-exists-p (lispm-auth-store-file))))))
+      (should-not (file-exists-p (expand-file-name "secrets.gpg" lispm-auth-directory))))))
 
 (ert-deftest lispm-auth-test-memory-holds-the-data-key-not-the-password ()
   "An open store holds a random data key, and neither the password nor
 its hash."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (let ((first (lispm-auth--new-data-key)))
         (should (string-match-p "\\`[0-9a-f]\\{64\\}\\'" first))
@@ -377,12 +419,12 @@ its hash."
       (lispm-auth-test--make-store "hunter2" (cons "id" "sk-secret"))
       (should lispm-auth--data-key)
       (should-not (equal lispm-auth--data-key "hunter2"))
-      (should-not (equal lispm-auth--data-key (lispm-auth--key "hunter2"))))))
+      (should-not (equal lispm-auth--data-key (secure-hash 'sha256 "hunter2"))))))
 
 (ert-deftest lispm-auth-test-auto-lock-locks-an-unused-store ()
   "A store not used for `lispm-auth-auto-lock' minutes is locked, and
 answers no-prompt reads with nil without asking."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-test--make-store "hunter2" (cons "id" "sk-secret"))
       (let ((lispm-auth-auto-lock 30))
@@ -401,7 +443,7 @@ answers no-prompt reads with nil without asking."
 
 (ert-deftest lispm-auth-test-auto-lock-never ()
   "With `lispm-auth-auto-lock' nil the store never runs out of time."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-test--make-store "hunter2" (cons "id" "sk-secret"))
       (let ((lispm-auth-auto-lock nil))
@@ -414,7 +456,7 @@ answers no-prompt reads with nil without asking."
 
 (ert-deftest lispm-auth-test-auto-lock-timer-follows-the-store ()
   "An open store has a lock timer; locking cancels it."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-test--make-store "hunter2" (cons "id" "sk-secret"))
       (let ((lispm-auth-auto-lock 5))
@@ -429,36 +471,12 @@ answers no-prompt reads with nil without asking."
         (lispm-auth-lock)
         (should-not lispm-auth--lock-timer)))))
 
-(ert-deftest lispm-auth-test-migrates-a-version-1-store ()
-  "A store an earlier LispM Auth wrote, all secrets in one file, is
-moved to a key and one file per secret; the old file is kept renamed."
-  (lispm-auth-test--unless-gpg
-    (lispm-auth-test--with-store
-      (let ((text (concat ";; LispM Auth secrets\n"
-                          (prin1-to-string
-                           (list :version 1
-                                 :secrets '(("first" . "sk-first")
-                                            ("second" . "sk-second"))))
-                          "\n")))
-        (lispm-auth--write-ciphertext (lispm-auth--encrypt text "hunter2")
-                                      (lispm-auth-store-file)))
-      (should (lispm-auth-store-exists-p))
-      (setq lispm-auth-test--answers '("hunter2"))
-      (should (lispm-auth-unlock))
-      (should (file-exists-p (lispm-auth-key-file)))
-      (should (file-exists-p (lispm-auth-store-file)))
-      (should (equal (lispm-auth--get "first") "sk-first"))
-      (should (equal (lispm-auth--get "second") "sk-second"))
-      (lispm-auth-lock)
-      (setq lispm-auth-test--answers '("hunter2"))
-      (should (lispm-auth-unlock))
-      (should (equal (lispm-auth--get "second") "sk-second")))))
 
 (ert-deftest lispm-auth-test-change-password ()
   "A changed password opens the store that the old one no longer does.
 The secrets are not encrypted again: only the key that opens them is
 wrapped anew."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (should-not (lispm-auth-store-exists-p))
       (lispm-auth-test--make-store "hunter2" (cons "id" "sk-secret"))
@@ -491,7 +509,7 @@ wrapped anew."
 (ert-deftest lispm-auth-test-change-password-asks-when-locked ()
   "Changing a locked store's password asks for the old one first, then
 asks for a new one on the page."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-test--make-store "hunter2" (cons "id" "sk-secret"))
       (lispm-auth-lock)
@@ -507,7 +525,7 @@ asks for a new one on the page."
 
 (ert-deftest lispm-auth-test-change-password-cancelled-leaves-it ()
   "A new password not given leaves the old one opening the store."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-test--make-store "hunter2" (cons "id" "sk-secret"))
       (setq lispm-auth-test--answers '("hunter2" nil))
@@ -521,7 +539,7 @@ asks for a new one on the page."
 
 (ert-deftest lispm-auth-test-change-password-failed-write-keeps-it ()
   "A write that fails keeps the old password, and the key file as it was."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-test--make-store "hunter2" (cons "id" "sk-secret"))
       (let ((before (lispm-auth-test--file-bytes (lispm-auth-key-file))))
@@ -540,7 +558,7 @@ asks for a new one on the page."
 
 (ert-deftest lispm-auth-test-change-password-makes-a-store ()
   "With no store yet, a password given makes one, holding no secret."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (should (lispm-auth-change-password "hunter2"))
       (should (lispm-auth-store-exists-p))
@@ -555,28 +573,26 @@ asks for a new one on the page."
 
 (ert-deftest lispm-auth-test-no-prompt-when-no-app-declares ()
   "Starting applications that declare nothing asks nothing, and touches nothing."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (should-not (lispm-auth-start-apps '(terminal browser)))
       (should-not lispm-auth-test--prompts)
-      (should-not (file-exists-p (lispm-auth--gpg-home)))
       (should-not (lispm-auth-store-exists-p)))))
 
 (ert-deftest lispm-auth-test-an-app-opened-alone-asks-nothing ()
   "An application opened on its own that declares nothing, as Gomoku
 does, shows no page and touches none of the encrypted data."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (should-not (lispm-auth-start-app 'gomoku))
       (should-not lispm-auth-test--prompts)
       (should (lispm-auth-locked-p))
-      (should-not (file-exists-p (lispm-auth--gpg-home)))
       (should-not (lispm-auth-store-exists-p)))))
 
 (ert-deftest lispm-auth-test-lispm-opened-alone-asks ()
   "LispM opened on its own asks for the password, though Control
 Panels has revoked the desktop's declaration."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-set-app-requires-password 'desktop nil)
       (setq lispm-auth-test--answers '("hunter2"))
@@ -586,14 +602,14 @@ Panels has revoked the desktop's declaration."
 
 (ert-deftest lispm-auth-test-no-apps-asks-nothing ()
   "Starting with no application at all asks nothing."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (should-not (lispm-auth-start-apps nil))
       (should-not lispm-auth-test--prompts))))
 
 (ert-deftest lispm-auth-test-desktop-asks-at-start ()
   "The desktop declares, so starting it asks for the password once."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (setq lispm-auth-test--answers '("hunter2"))
       (should (lispm-auth-start-apps '(desktop)))
@@ -618,7 +634,7 @@ Panels has revoked the desktop's declaration."
 
 (ert-deftest lispm-auth-test-desktop-revoked-asks-nothing-at-start ()
   "With the desktop revoked, opening it touches no encrypted data."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-set-app-requires-password 'desktop nil)
       (should-not (lispm-auth-start-apps '(desktop)))
@@ -647,7 +663,7 @@ Panels has revoked the desktop's declaration."
 
 (ert-deftest lispm-auth-test-start-makes-the-first-store ()
   "The first start with a declaring application makes a store."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (setq lispm-auth-test--answers '("new-password"))
       (should (lispm-auth-start-apps '(desktop)))
@@ -659,7 +675,7 @@ Panels has revoked the desktop's declaration."
 
 (ert-deftest lispm-auth-test-no-prompt-never-asks ()
   "Reading with NO-PROMPT while locked answers nil, and asks nothing."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-test--make-store "hunter2" (cons "id" "sk-secret"))
       (lispm-auth-lock)
@@ -673,16 +689,15 @@ Panels has revoked the desktop's declaration."
 
 (ert-deftest lispm-auth-test-no-prompt-without-a-store ()
   "Reading with NO-PROMPT without a store makes none, and asks nothing."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (should-not (lispm-auth--secret-get "id" t))
       (should-not lispm-auth-test--prompts)
-      (should-not (file-exists-p (lispm-auth--gpg-home)))
       (should-not (lispm-auth-store-exists-p)))))
 
 (ert-deftest lispm-auth-test-prompt-when-asked ()
   "Reading without NO-PROMPT asks for the password and answers."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-test--make-store "hunter2" (cons "id" "sk-secret"))
       (lispm-auth-lock)
@@ -693,7 +708,7 @@ Panels has revoked the desktop's declaration."
 
 (ert-deftest lispm-auth-test-no-prompt-when-unlocked ()
   "Reading with NO-PROMPT from an open store answers, without asking again."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-test--make-store "hunter2" (cons "id" "sk-secret"))
       (setq lispm-auth-test--prompts nil)
@@ -712,7 +727,7 @@ Panels has revoked the desktop's declaration."
 
 (ert-deftest lispm-auth-test-hooks-answer ()
   "The handlers answer as LispM's core asks them to."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (should (run-hook-with-args-until-success
                'lispm-secret-available-functions))
@@ -731,10 +746,9 @@ Panels has revoked the desktop's declaration."
 
 (ert-deftest lispm-auth-test-available-without-a-store ()
   "The store is available before any is made: a first key can be kept."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (should (lispm-auth--secret-available))
-      (should-not (file-exists-p (lispm-auth--gpg-home)))
       (should-not (lispm-auth-store-exists-p)))))
 
 ;;;; Moving backends' literal keys into the store
@@ -754,7 +768,7 @@ and what `lispm-settings-set' was given."
 
 (ert-deftest lispm-auth-test-migrates-a-literal-key ()
   "A literal key moves into the store, and the backends are saved with it gone."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-test--make-store "hunter2")
       (setq lispm-auth-test--prompts nil)
@@ -779,7 +793,7 @@ and what `lispm-settings-set' was given."
 
 (ert-deftest lispm-auth-test-migration-touches-other-keys-not ()
   "Keys from the environment, auth-source, characters, or the store stay."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-test--make-store "hunter2")
       (let* ((stored (list :api 'openai :url "https://a" :model "m"
@@ -808,7 +822,7 @@ and what `lispm-settings-set' was given."
 
 (ert-deftest lispm-auth-test-unlock-migrates-once ()
   "The first successful opening moves the literal keys."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-test--make-store "hunter2")
       (lispm-auth-lock)
@@ -922,7 +936,7 @@ cleared as the page closes would encrypt NUL characters instead."
 
 (ert-deftest lispm-auth-test-page-asks-again-after-a-wrong-password ()
   "A wrong password is said so on the page, and asked for again."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-test--make-store "right" (cons "id" "sk-secret"))
       (lispm-auth-lock)
@@ -948,7 +962,7 @@ cleared as the page closes would encrypt NUL characters instead."
 
 (ert-deftest lispm-auth-test-page-not-shown-when-already-open ()
   "A store opened this session asks for nothing at a later start."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-test--make-store "right")
       (let ((noninteractive nil)
@@ -963,7 +977,7 @@ cleared as the page closes would encrypt NUL characters instead."
 
 (ert-deftest lispm-auth-test-page-not-shown-when-desktop-revoked ()
   "With the desktop revoked, starting it shows no page and opens nothing."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-set-app-requires-password 'desktop nil)
       (let ((noninteractive nil)
@@ -978,7 +992,7 @@ cleared as the page closes would encrypt NUL characters instead."
 
 (ert-deftest lispm-auth-test-page-first-start-makes-the-store ()
   "The first start asks for a new password twice, and makes the store."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (let ((noninteractive nil)
             (lispm-auth-password-function #'lispm-auth--read-password)
@@ -1042,7 +1056,7 @@ asking for the old one while it is changed."
 (ert-deftest lispm-auth-test-page-changes-the-password ()
   "C-p on the entry page asks for the old password, then for a new one
 twice, and encrypts the store with the new one; the secrets stay."
-  (lispm-auth-test--unless-gpg
+  (lispm-auth-test--with-service
     (lispm-auth-test--with-store
       (lispm-auth-test--make-store "hunter2" (cons "id" "sk-secret"))
       (lispm-auth-lock)
@@ -1077,15 +1091,6 @@ twice, and encrypts the store with the new one; the secrets stay."
           (setq lispm-auth-test--answers '("another"))
           (should (lispm-auth-unlock))
           (should (equal (lispm-auth--get "id") "sk-secret")))))))
-
-(ert-deftest lispm-auth-test-key-is-the-passwords-hash ()
-  "The store is encrypted with the SHA-256 of the password, not with the
-password itself."
-  (should (equal (lispm-auth--key "hunter2")
-                 (secure-hash 'sha256
-                              (encode-coding-string "hunter2" 'utf-8-unix))))
-  (should-not (equal (lispm-auth--key "hunter2") "hunter2"))
-  (should-not (equal (lispm-auth--key "hunter2") (lispm-auth--key "hunter3"))))
 
 
 (ert-deftest lispm-auth-test-page-fills-a-terminal-frame ()

@@ -30,7 +30,7 @@
 ;; The keys are encrypted at rest by the Common Lisp authenticated-crypto
 ;; service, in a store opened by a password once a session.  A key is
 ;; never written in plaintext: each secret is authenticated independently
-;; and written in one step.  GnuPG is needed only for legacy migration.
+;; and written in one step.  No external encryption tool is needed.
 ;;
 ;; The password does not encrypt the secrets.  It unwraps one random data
 ;; key, kept wrapped in a file of its own, and that key alone is what
@@ -97,6 +97,7 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'subr-x)
+(require 'url)
 
 (declare-function lispm-backend-secret-id "lispm-settings" (name))
 (declare-function lispm-settings-set "lispm-settings" (variable value &optional save))
@@ -121,17 +122,6 @@
 The store is encrypted; the declarations are not secrets.  Both are
 kept private to you."
   :type 'directory
-  :group 'lispm-auth)
-
-(defcustom lispm-auth-gpg-program "gpg"
-  "GnuPG program LispM Auth encrypts with.
-It must be GnuPG 2.1 or later, for its loopback pinentry."
-  :type 'string
-  :group 'lispm-auth)
-
-(defcustom lispm-auth-cipher-algorithm "AES256"
-  "Cipher GnuPG encrypts the store with."
-  :type 'string
   :group 'lispm-auth)
 
 (defcustom lispm-auth-password-attempts 3
@@ -276,12 +266,6 @@ The logo is shown on a graphical display only."
   :group 'lispm-auth)
 
 
-(defun lispm-auth-store-file ()
-  "Return the file an earlier LispM Auth kept all its secrets in.
-It holds a version 1 store; it is read once, moved to the keyed form,
-and kept renamed beside it."
-  (expand-file-name "secrets.gpg" lispm-auth-directory))
-
 (defun lispm-auth-key-file ()
   "Return the file the store's data key is wrapped in.
 The key is 32 random bytes, encrypted with the password's key; the
@@ -297,17 +281,20 @@ secrets are encrypted with it, each in a file under
   "Return the file LispM Auth keeps its applications' declarations in."
   (expand-file-name "apps.eld" lispm-auth-directory))
 
-(defun lispm-auth-store-exists-p ()
-  "Return non-nil when a store has been made here.
-Control Panels shows whether a password is set with this.  A version 1
-store counts: opening it moves it to the keyed form."
-  (or (file-exists-p (expand-file-name "native" lispm-auth-directory))
-      (file-exists-p (expand-file-name "key.gpg" lispm-auth-directory))
-      (file-exists-p (lispm-auth-store-file))))
+(defun lispm-auth--legacy-store-p ()
+  "Return non-nil if an unsupported older store is present.
+Even an incomplete store or dangling symlink must not be overwritten."
+  (seq-some (lambda (name)
+              (let ((file (expand-file-name name lispm-auth-directory)))
+                (or (file-exists-p file) (file-symlink-p file))))
+            '("key.gpg" "secrets.gpg" "secrets")))
 
-(defun lispm-auth--gpg-home ()
-  "Return the GnuPG home directory LispM Auth uses, private to it."
-  (expand-file-name "gnupg/" lispm-auth-directory))
+(defun lispm-auth-store-exists-p ()
+  "Return non-nil when a store, including an unsupported old one, exists.
+Older stores count so that creating a new store cannot hide their secrets."
+  (let ((native (expand-file-name "native" lispm-auth-directory)))
+    (or (file-exists-p native) (file-symlink-p native)
+        (lispm-auth--legacy-store-p))))
 
 (define-error 'lispm-auth-error "LispM Auth error")
 (define-error 'lispm-auth-wrong-password "Wrong password" 'lispm-auth-error)
@@ -1094,134 +1081,189 @@ which cannot ask."
         nil)
     (lispm-auth--page-read prompt confirm lispm-auth-password-message)))
 
-(defun lispm-auth--ensure-gpg-home ()
-  "Create and return the GnuPG home directory, private to you.
-GnuPG refuses to work in a home directory others may open."
-  (let ((home (expand-file-name "gnupg/" (lispm-auth--ensure-directory))))
-    (unless (file-directory-p home)
-      (make-directory home))
-    (ignore-errors (set-file-modes home #o700))
-    home))
-
-;;;; GnuPG
-
-(defun lispm-auth--gpg (input arguments)
-  "Run GnuPG with ARGUMENTS on INPUT, a unibyte string.
-Return a plist (:status EXIT :output STRING :error STRING)."
-  (let* ((stderr-file (make-temp-file "lispm-auth-gpg"))
-         (home (lispm-auth--ensure-gpg-home))
-         (output nil)
-         (error-output nil)
-         (status nil)
-         (program lispm-auth-gpg-program))
-    (unless (executable-find program)
-      (ignore-errors (delete-file stderr-file))
-      (signal 'lispm-auth-unavailable (list program)))
-    (unwind-protect
-        (with-temp-buffer
-          (set-buffer-multibyte nil)
-          (insert input)
-          (let ((coding-system-for-read 'no-conversion)
-                (coding-system-for-write 'no-conversion)
-                (process-environment
-                 (cons "GPG_TTY="
-                       (seq-remove (lambda (entry)
-                                     (string-prefix-p "GPG_TTY=" entry))
-                                   process-environment))))
-            ;; The input leaves the buffer first, so that what is read
-            ;; back after GnuPG ran is its output alone.
-            (setq status
-                  (apply #'call-process-region
-                         (point-min) (point-max) program t
-                         (list t stderr-file) nil
-                         (append (list "--batch" "--yes" "--no-tty"
-                                       "--no-options" "--no-symkey-cache"
-                                       "--pinentry-mode" "loopback"
-                                       "--homedir" home)
-                                 arguments)))
-            (setq output (buffer-string))))
-      (with-temp-buffer
-        (set-buffer-multibyte nil)
-        (insert-file-contents-literally stderr-file)
-        (setq error-output (buffer-string)))
-      (ignore-errors (delete-file stderr-file)))
-    (list :status status :output output :error error-output)))
-
-(defun lispm-auth--said (error-output)
-  "Return ERROR-OUTPUT, GnuPG's, as one line to show."
-  (string-trim
-   (replace-regexp-in-string
-    "\\`\\(?:gpg\\|gpg2\\): \\(?:[A-Za-z]+: \\)?" ""
-    (string-trim error-output))))
-
-(defun lispm-auth--key (password)
-  "Return the key the store is encrypted with: the SHA-256 of PASSWORD.
-The password itself never opens the store; its hash does, so that the
-key is a fixed-length, high-entropy string whatever was typed."
-  (secure-hash 'sha256 (encode-coding-string password 'utf-8-unix)))
-
-(defun lispm-auth--encrypt-with (text passphrase)
-  "Produce legacy OpenPGP ciphertext; only used for legacy fixtures."
-  (let ((result (lispm-auth--gpg
-                 (encode-coding-string (concat passphrase "\n" text) 'utf-8-unix)
-                 (list "--passphrase-fd" "0" "--symmetric"
-                       "--cipher-algo" lispm-auth-cipher-algorithm
-                       "--s2k-digest-algo" "SHA512" "--compress-algo" "none"
-                       "--output" "-"))))
-    (unless (eql 0 (plist-get result :status))
-      (error "LispM Auth: legacy encryption failed: %s" (plist-get result :error)))
-    (plist-get result :output)))
-
-(defun lispm-auth--encrypt (text password)
-  "Return TEXT, encrypted with the key PASSWORD gives, as a unibyte string."
-  (lispm-auth--encrypt-with text (lispm-auth--key password)))
-
-(defun lispm-auth--decrypted (result what)
-  "Return RESULT's output as text, or signal why WHAT did not open.
-RESULT is what `lispm-auth--gpg' answered.  A wrong passphrase signals
-`lispm-auth-wrong-password'; another failure is an error."
-  (cond
-   ((eql 0 (plist-get result :status))
-    (decode-coding-string (plist-get result :output) 'utf-8-unix))
-   ((string-match-p "decryption failed\\|Bad session key\\|session key decryption failed"
-                    (plist-get result :error))
-    (signal 'lispm-auth-wrong-password nil))
-   (t
-    (error "LispM Auth: cannot decrypt %s: %s"
-           what (lispm-auth--said (plist-get result :error))))))
-
-(defun lispm-auth--decrypt-with (ciphertext passphrase)
-  "Decrypt legacy CIPHERTEXT using PASSPHRASE via standard input."
-  (let ((file (make-temp-file "lispm-auth-ciphertext-")))
-    (unwind-protect
-        (progn
-          (let ((coding-system-for-write 'no-conversion))
-            (write-region ciphertext nil file nil 'silent))
-          (lispm-auth--decrypt-file file passphrase))
-      (ignore-errors (delete-file file)))))
-
-(defun lispm-auth--decrypt (ciphertext password)
-  "Return the text CIPHERTEXT, an OpenPGP message, holds, opened with
-the key PASSWORD gives.  Signal `lispm-auth-wrong-password' when
-PASSWORD is not the one."
-  (lispm-auth--decrypt-with ciphertext (lispm-auth--key password)))
-
-(defun lispm-auth--decrypt-file (file passphrase)
-  "Return the text FILE, an OpenPGP message, holds, opened with PASSPHRASE.
-PASSPHRASE goes to GnuPG on its input, so it is not written to disk."
-  (lispm-auth--decrypted
-   (lispm-auth--gpg (encode-coding-string (concat passphrase "\n")
-                                          'utf-8-unix)
-                    (list "--passphrase-fd" "0" "--decrypt" file))
-   "the secret"))
-
 (defconst lispm-auth--package-directory
   (file-name-directory (or load-file-name buffer-file-name))
   "Directory holding LispM Auth and its Common Lisp service.")
 
-(defcustom lispm-auth-lisp-program "sbcl"
-  "SBCL executable used to run the crypto service."
-  :type 'string :group 'lispm-auth)
+(defcustom lispm-auth-service-program nil
+  "Absolute filename of the standalone LispM Auth crypto executable.
+Nil uses prebuilt/<platform>/lispm-auth-service in this package, then the
+fixed release installed by `lispm-auth-install-service'.  The service is
+unavailable until an artifact is installed.  No PATH search,
+shell, Lisp interpreter, or source-file fallback is used."
+  :type '(choice (const :tag "Package executable" nil) file)
+  :group 'lispm-auth)
+
+(defconst lispm-auth-service-version "v0.2.0"
+  "Fixed service release used by this client; never a moving latest URL.")
+
+(defconst lispm-auth-service-sha256 nil
+  "Alist of (PLATFORM . SHA256) pins for the fixed service release.
+Empty until release assets have been built and independently verified.
+Never obtain trusted hashes from the same download as the executable.")
+
+(defcustom lispm-auth-service-directory (locate-user-emacs-file "lispm-auth-service/")
+  "Directory for explicitly installed, versioned service releases.
+This is separate from the encrypted store.  Loading LispM Auth never downloads."
+  :type 'directory :group 'lispm-auth)
+
+(defun lispm-auth--installed-service-directory (platform)
+  "Return the fixed release installation directory for PLATFORM."
+  (expand-file-name (concat lispm-auth-service-version "/" platform "/")
+                    lispm-auth-service-directory))
+
+(defun lispm-auth--service-platform ()
+  "Return the supported artifact platform name, or nil."
+  (let ((os (pcase system-type ('darwin "darwin") ('gnu/linux "linux")))
+        (arch (cond ((string-match-p "\\`\\(?:aarch64\\|arm64\\)" system-configuration)
+                     "arm64")
+                    ((string-match-p "\\`x86_64" system-configuration)
+                     "x86_64"))))
+    (let ((platform (and os arch (concat os "-" arch))))
+      (and (member platform '("darwin-arm64" "darwin-x86_64" "linux-x86_64"))
+           platform))))
+
+(defun lispm-auth--service-program ()
+  "Resolve the standalone service executable, or signal unavailability."
+  (let* ((platform (lispm-auth--service-platform))
+         (packaged (and platform
+                        (expand-file-name
+                         (concat "prebuilt/" platform "/lispm-auth-service")
+                         lispm-auth--package-directory)))
+         (program (or lispm-auth-service-program
+                      (and packaged (file-exists-p packaged) packaged)
+                      (and platform
+                           (expand-file-name "lispm-auth-service"
+                                             (lispm-auth--installed-service-directory platform))))))
+    (unless (and (stringp program)
+                 (file-name-absolute-p program)
+                 (not (file-remote-p program))
+                 (file-regular-p program)
+                 (file-executable-p program))
+      (signal 'lispm-auth-unavailable
+              '("Install the standalone service artifact or set lispm-auth-service-program to an absolute executable path")))
+    program))
+
+(defun lispm-auth--tar-number (text)
+  "Read an unsigned octal USTAR numeric field TEXT, rejecting extensions."
+  (let ((number (string-trim text "[ \0]+" "[ \0]+")))
+    (unless (string-match-p "\\`[0-7]+\\'" number)
+      (signal 'lispm-auth-error '("Invalid service archive number")))
+    (string-to-number number 8)))
+
+(defun lispm-auth--extract-service (archive directory)
+  "Extract verified gzip USTAR ARCHIVE into empty DIRECTORY.
+Only portable relative paths, regular files and directories are accepted.
+No external archiver, symlinks, hardlinks, devices or archive extensions."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally archive)
+    (unless (and (fboundp 'zlib-decompress-region)
+                 (zlib-decompress-region (point-min) (point-max)))
+      (signal 'lispm-auth-error '("Cannot decompress service archive")))
+    (when (> (buffer-size) (* 128 1024 1024))
+      (signal 'lispm-auth-error '("Service archive is too large")))
+    (let ((position 1) (seen nil) (ended nil))
+      (while (not ended)
+        (when (> (+ position 511) (point-max))
+          (signal 'lispm-auth-error '("Truncated service archive")))
+        (let* ((header (buffer-substring position (+ position 512)))
+               (name (car (split-string (substring header 0 100) "\0")))
+               (size (unless (string= header (make-string 512 0))
+                       (lispm-auth--tar-number (substring header 124 136)))))
+          (if (null size)
+              (progn
+                (unless (and (>= (- (point-max) position) 1024)
+                             (string-match-p "\\`\0*\\'"
+                                             (buffer-substring position (point-max))))
+                  (signal 'lispm-auth-error '("Invalid service archive trailer")))
+                (setq ended t))
+            (unless (and (string= (substring header 257 263) "ustar\0")
+                         (string= (substring header 263 265) "00")
+                         (string-match-p "\\`\0*\\'" (substring header 345 500))
+                         (string-match-p "\\`[A-Za-z0-9_-][A-Za-z0-9_./+-]*\\'" name)
+                         (not (member name seen))
+                         (not (seq-some (lambda (part) (member part '("." ".." "")))
+                                        (split-string (string-remove-suffix "/" name) "/")))
+                         (memq (aref header 156) '(0 ?0 ?5)))
+              (signal 'lispm-auth-error '("Unsafe service archive entry")))
+            (let ((sum 0) (check (lispm-auth--tar-number (substring header 148 156))))
+              (dotimes (i 512)
+                (setq sum (+ sum (if (and (>= i 148) (< i 156)) 32 (aref header i)))))
+              (unless (= sum check)
+                (signal 'lispm-auth-error '("Invalid service archive checksum"))))
+            (push name seen)
+            (let ((file (expand-file-name name directory))
+                  (start (+ position 512)))
+              (when (> (+ start size) (point-max))
+                (signal 'lispm-auth-error '("Truncated service archive entry")))
+              (if (= (aref header 156) ?5)
+                  (progn
+                    (unless (zerop size)
+                      (signal 'lispm-auth-error '("Invalid archive directory")))
+                    (make-directory file t))
+                (make-directory (file-name-directory file) t)
+                (let ((coding-system-for-write 'no-conversion))
+                  (write-region start (+ start size) file nil 'silent))
+                (set-file-modes file (if (equal name "lispm-auth-service") #o700 #o600)))
+              (setq position (+ start (* 512 (/ (+ size 511) 512)))))))))))
+
+(defun lispm-auth--download-service (url file)
+  "Download HTTPS URL to FILE on explicit installation only."
+  (require 'url)
+  (let ((url-request-extra-headers nil)
+        (url-privacy-level 'paranoid))
+    (url-copy-file url file t)))
+
+(defun lispm-auth-install-service (&optional archive)
+  "Install the fixed, SHA256-pinned service for this platform.
+Interactively download only after confirmation; ARCHIVE supplies a local
+release archive instead.  No valid pin means no network or extraction.
+An existing installation is never overwritten."
+  (interactive)
+  (let* ((platform (lispm-auth--service-platform))
+         (pin (cdr (assoc platform lispm-auth-service-sha256)))
+         (destination (and platform (lispm-auth--installed-service-directory platform))))
+    (unless (and platform (stringp pin)
+                 (string-match-p "\\`[0-9a-f]\\{64\\}\\'" pin))
+      (user-error "No verified %s service release pin is published for %s"
+                  lispm-auth-service-version (or platform "this platform")))
+    (when (or (file-exists-p (directory-file-name destination))
+              (file-symlink-p (directory-file-name destination)))
+      (user-error "Service installation already exists: %s" destination))
+    (when (and (not archive) (called-interactively-p 'interactive)
+               (not (yes-or-no-p (format "Download LispM Auth %s service? " lispm-auth-service-version))))
+      (user-error "Service installation cancelled"))
+    (make-directory (file-name-directory (directory-file-name destination)) t)
+    (let ((temporary (make-temp-file "lispm-auth-release-"))
+          (staging (make-temp-file
+                    (expand-file-name ".install-" (file-name-directory
+                                                   (directory-file-name destination))) t)))
+      (unwind-protect
+          (progn
+            (if archive
+                (copy-file archive temporary t)
+              (lispm-auth--download-service
+               (format "https://github.com/LispMachineLab/lispm-auth/releases/download/%s/lispm-auth-service-%s-%s.tar.gz"
+                       lispm-auth-service-version lispm-auth-service-version platform)
+               temporary))
+            (when (> (file-attribute-size (file-attributes temporary)) (* 64 1024 1024))
+              (signal 'lispm-auth-error '("Service download is too large")))
+            (unless (equal pin (with-temp-buffer
+                                (set-buffer-multibyte nil)
+                                (insert-file-contents-literally temporary)
+                                (secure-hash 'sha256 (current-buffer))))
+              (signal 'lispm-auth-error '("Service archive SHA256 mismatch")))
+            (lispm-auth--extract-service temporary staging)
+            (let* ((lispm-auth-service-program (expand-file-name "lispm-auth-service" staging))
+                   (probe (lispm-auth--service "random")))
+              (unless (string-match-p "\\`[0-9a-f]\\{64\\}\\'" probe)
+                (signal 'lispm-auth-error '("Installed service failed its probe"))))
+            (rename-file staging (directory-file-name destination))
+            (message "LispM Auth service installed: %s" destination)
+            destination)
+        (delete-file temporary)
+        (when (file-directory-p staging) (delete-directory staging t))))))
 
 (defcustom lispm-auth-service-timeout 30
   "Maximum seconds for one crypto service request."
@@ -1237,13 +1279,9 @@ PASSPHRASE goes to GnuPG on its input, so it is not written to disk."
 (defun lispm-auth--service (operation &rest fields)
   "Send OPERATION and hexadecimal FIELDS to a fresh crypto process.
 Return its hexadecimal result.  Never retain or display its stderr."
-  (let* ((program (and (stringp lispm-auth-lisp-program)
-                       (executable-find lispm-auth-lisp-program)))
-         (script (expand-file-name "common-lisp/service.lisp" lispm-auth--package-directory))
+  (let* ((program (lispm-auth--service-program))
          (request (concat (mapconcat #'identity (cons operation fields) "\t") "\n"))
          (output "") (overflow nil) (process nil) (stderr-process nil))
-    (unless (and program (file-readable-p script))
-      (signal 'lispm-auth-unavailable '("Crypto service is unavailable")))
     (unwind-protect
         (with-timeout (lispm-auth-service-timeout
                        (signal 'lispm-auth-unavailable '("Crypto service timed out")))
@@ -1257,7 +1295,7 @@ Return its hexadecimal result.  Never retain or display its stderr."
                       (make-process
                        :name "lispm-auth-service" :buffer nil :noquery t
                        :connection-type 'pipe :coding 'no-conversion
-                       :command (list program "--noinform" "--script" script)
+                       :command (list program)
                        :stderr stderr-process
                        :sentinel #'ignore
                        :filter (lambda (_process data)
@@ -1308,28 +1346,6 @@ Return its hexadecimal result.  Never retain or display its stderr."
 
 ;;;; The store's contents
 
-(defun lispm-auth--deserialize (text)
-  "Return the secrets TEXT, a version 1 store's contents, holds.
-Signal an error when TEXT is not a store LispM Auth understands."
-  (let* ((read-eval nil)
-         (form (car (read-from-string text))))
-    (if (and (listp form)
-             (eql (plist-get form :version) 1)
-             (listp (plist-get form :secrets)))
-        (plist-get form :secrets)
-      (error "LispM Auth: the store is not one LispM Auth understands"))))
-
-(defun lispm-auth--read-store (password)
-  "Return the secrets a version 1 store holds, opened with PASSWORD.
-A version 1 store kept them all in one file; opening it moves them to
-the keyed form, one file each."
-  (let* ((file (lispm-auth-store-file))
-         (ciphertext (with-temp-buffer
-                       (set-buffer-multibyte nil)
-                       (insert-file-contents-literally file)
-                       (buffer-string))))
-    (lispm-auth--deserialize (lispm-auth--decrypt ciphertext password))))
-
 (defun lispm-auth--write-ciphertext (ciphertext file)
   "Write CIPHERTEXT to FILE in one step, readable only by you; return FILE.
 A failure leaves FILE as it was."
@@ -1376,52 +1392,6 @@ A failure leaves FILE as it was."
       (when (and new-directory (not written) (file-directory-p directory))
         (ignore-errors (delete-directory directory)))))
   t)
-
-(defun lispm-auth--migrate-store (password)
-  "Migrate a legacy store atomically, retaining all legacy files."
-  (let* ((legacy-key (expand-file-name "key.gpg" lispm-auth-directory))
-         (legacy-items (expand-file-name "secrets" lispm-auth-directory))
-         (key (lispm-auth--new-data-key))
-         (stage (make-temp-file (expand-file-name ".native-stage-" (lispm-auth--ensure-directory)) t))
-         (destination (expand-file-name "native" lispm-auth-directory))
-         (committed nil))
-    (unwind-protect
-        (let ((entries
-               (if (file-exists-p legacy-key)
-                   (let ((old-key (string-trim (lispm-auth--decrypt-file legacy-key (lispm-auth--key password))))
-                         (result nil))
-                     (unwind-protect
-                         (progn
-                           (unless (string-match-p "\\`[[:xdigit:]]\\{64\\}\\'" old-key)
-                             (error "Invalid legacy key"))
-                           (when (file-directory-p legacy-items)
-                             (dolist (file (directory-files legacy-items t directory-files-no-dot-files-regexp))
-                               (unless (and (file-regular-p file)
-                                            (string-match-p "\\.gpg\\'" file))
-                                 (error "Unexpected legacy item: %s" file))
-                               (let* ((read-eval nil)
-                                      (pair (car (read-from-string (lispm-auth--decrypt-file file old-key)))))
-                                 (unless (and (consp pair) (stringp (car pair))
-                                              (equal (file-name-nondirectory file)
-                                                     (concat (secure-hash 'sha256 (encode-coding-string (car pair) 'utf-8-unix)) ".gpg")))
-                                   (error "Invalid legacy item"))
-                                 (push pair result))))
-                           result)
-                       (clear-string old-key)))
-                 (lispm-auth--read-store password))))
-          (let ((lispm-auth-directory (file-name-as-directory stage))
-                (lispm-auth--data-key key)
-                (lispm-auth--unlocked t))
-            (dolist (entry entries)
-              (unless (and (consp entry) (stringp (cdr entry)))
-                (error "Invalid legacy entry"))
-              (lispm-auth--set (car entry) (cdr entry)))
-            (lispm-auth--write-data-key key password))
-          (rename-file (expand-file-name "native" stage) destination)
-          (setq committed t)
-          key)
-      (unless committed (clear-string key))
-      (when (file-directory-p stage) (delete-directory stage t)))))
 
 (defun lispm-auth--id (id)
   "Return ID, a secret's name, as the string the store keeps.
@@ -1495,16 +1465,27 @@ place is not read as the secret asked for."
 
 ;;;; Opening the store
 
+(defun lispm-auth--check-store-format ()
+  "Reject an unsupported or incomplete store without changing any files."
+  (unless (file-exists-p (lispm-auth-key-file))
+    (cond ((lispm-auth--legacy-store-p)
+           (signal 'lispm-auth-error
+                   '("Unsupported legacy OpenPGP store; automatic migration is not supported. Existing files were left unchanged")))
+          ((lispm-auth-store-exists-p)
+           (signal 'lispm-auth-error '("Incomplete native store: wrapped key is missing"))))))
+
 (defun lispm-auth--open (password)
   "Return the store's data key, unwrapped with PASSWORD.
-A version 1 store is moved to the keyed form first.  Signal
-`lispm-auth-wrong-password' when PASSWORD is not the one."
-  (if (file-exists-p (lispm-auth-key-file))
-      (lispm-auth--read-data-key password)
-    (lispm-auth--migrate-store password)))
+Signal `lispm-auth-wrong-password' when PASSWORD is not the one.
+Unsupported old stores are never migrated or overwritten."
+  (lispm-auth--check-store-format)
+  (lispm-auth--read-data-key password))
 
 (defun lispm-auth--create ()
   "Make a store with a new password; return non-nil when it was made."
+  (lispm-auth--check-store-format)
+  (when (lispm-auth-store-exists-p)
+    (signal 'lispm-auth-error '("A store already exists")))
   (let* ((lispm-auth-password-message nil)
          (password (funcall lispm-auth-password-function
                             "New LispM password: " t)))
@@ -1579,6 +1560,7 @@ then for a new one twice, and wraps the data key with the new one."
 Return non-nil when it is open, nil when the user gave no password.
 Make a store with a new password when there is none yet.  Signal
 `user-error' when the password given is not the store's."
+  (lispm-auth--check-store-format)
   (if lispm-auth--unlocked
       t
     (let ((opened (if (lispm-auth-store-exists-p)
@@ -1613,9 +1595,7 @@ the password is only tried against it."
           (setq attempt lispm-auth-password-attempts))
          (t
           (condition-case nil
-              (progn (if (file-exists-p (lispm-auth-key-file))
-                         (lispm-auth--read-data-key password)
-                       (lispm-auth--read-store password))
+              (progn (lispm-auth--open password)
                      (setq ok t))
             (lispm-auth-wrong-password
              (setq attempt (1+ attempt))
@@ -1634,6 +1614,7 @@ made yet is made with the new password.  Only the data key is wrapped
 again: no secret is encrypted anew.  Return non-nil when the password
 changed."
   (interactive)
+  (lispm-auth--check-store-format)
   (let ((lispm-auth--changing t)
         (key nil))
     (when (lispm-auth-store-exists-p)
@@ -1772,12 +1753,6 @@ Return non-nil when it was there."
   "Return non-nil when LispM Auth can keep secrets here.
 That is: the Common Lisp crypto service can run."
   (condition-case nil (progn (lispm-auth--new-data-key) t) (error nil)))
-
-(defun lispm-auth--gpg-program-p ()
-  "Return non-nil when the GnuPG program LispM Auth uses is here."
-  (and (stringp lispm-auth-gpg-program)
-       (not (string-empty-p lispm-auth-gpg-program))
-       (executable-find lispm-auth-gpg-program)))
 
 (add-hook 'lispm-secret-get-functions #'lispm-auth--secret-get)
 (add-hook 'lispm-secret-set-functions #'lispm-auth--secret-set)

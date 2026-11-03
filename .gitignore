@@ -1,3 +1,8 @@
 *.elc
 /.deps/
 /native/target/
+/build/
+/dist/
+/prebuilt/
+__pycache__/
+*.pyc

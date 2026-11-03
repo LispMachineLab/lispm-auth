@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Exercise the Common Lisp service using public compatibility vectors."""
+import os
 import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+SERVICE = os.environ.get('LISPM_AUTH_SERVICE', str(ROOT.parent / 'build' / 'lispm-auth-service'))
 
 
 def call(op, *args):
     p = subprocess.run(
-        ['sbcl', '--noinform', '--no-userinit', '--no-sysinit', '--non-interactive',
-         '--load', str(ROOT / 'service.lisp')],
+        [SERVICE],
         input='\t'.join((op, *args)) + '\n', text=True,
         capture_output=True, timeout=30, check=True)
     assert not p.stderr, 'unexpected service stderr'

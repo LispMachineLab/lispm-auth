@@ -6,14 +6,41 @@ secrets, so that only their starts ask for the password.  In code, the prefix is
 
 * What it needs
 
-- *SBCL, CFFI and libsodium*: the Common Lisp service uses libsodium for password derivation and
-  authenticated encryption. CFFI and its dependencies must be visible to ASDF without SBCL init
-  files; for example, set =CL_SOURCE_REGISTRY= to include the Quicklisp software directory before
-  starting Emacs. LispM Auth does not bundle these runtime dependencies; a legacy OpenPGP store
-  also needs GnuPG for migration.
+- *Emacs 30.1 or later* and a standalone service release for your platform. End users do not
+  install SBCL, ECL, ASDF, CFFI, GnuPG, Homebrew or libsodium. The service is compiled Common Lisp
+  (ECL), with libsodium linked statically and non-system runtime libraries bundled beside it.
 - *LispM's core*, to ask it for a secret: the hooks are ordinary variables (=lispm-secret-get-functions=
-  and the three others in =lispm-core.el=), so they may be added to before LispM is loaded.  LispM
-  Auth itself works without LispM, for its two declarations' functions and its own start.
+  and the three others in =lispm-core.el=), so they may be added to before LispM is loaded. LispM
+  Auth itself works without LispM, for its declarations' functions and its own start.
+
+* Installing the service
+
+The release targets are =darwin-arm64=, =darwin-x86_64= and =linux-x86_64= (glibc, Ubuntu 22.04
+or newer). macOS CI builds use macOS 14 (ARM64) and macOS 15 (Intel); compatibility with older
+macOS releases is not promised. Other systems are not yet supported. Use the *whole* extracted archive: the executable,
+=lib/= and =licenses/= must stay together. Projects distributing LispM Auth can put its contents
+in =prebuilt/PLATFORM/= next to =lispm-auth.el=, or set =lispm-auth-service-program= to an absolute
+local executable filename. The resolver never searches PATH or launches a Lisp interpreter.
+
+=lispm-auth-install-service= is the explicit download/install command. It uses the fixed
+=lispm-auth-service-version= and a SHA256 pin in =lispm-auth-service-sha256=, verifies the archive
+before extraction, rejects links and unsafe paths, probes the executable, then activates a new
+versioned directory atomically. Existing installations are not overwritten. Merely loading the
+package or opening a store never downloads anything. With a local release archive:
+
+#+begin_src emacs-lisp
+(lispm-auth-install-service "/path/to/lispm-auth-service-v0.2.0-darwin-arm64.tar.gz")
+#+end_src
+
+*Publication status:* no verified release hashes are recorded in this source yet. Until the CI
+artifacts are built, tested, published and their actual hashes reviewed and pinned in a subsequent
+client update, the installer fails clearly *before any network request*. It does not invent hashes,
+trust a checksum downloaded alongside an executable, or fall back to installing build tools.
+A developer-built service can be selected explicitly while release publication is pending.
+
+macOS bundles are ad-hoc signed for loader integrity, not Developer ID signed or notarized.
+Gatekeeper/download quarantine may require your distribution's normal signing and notarization
+process. No installer removes quarantine automatically.
 
 * The store
 
@@ -25,9 +52,10 @@ secret on demand. Passwords, keys and plaintext are not deliberately written to 
 Emacs and the operating system may retain copies in memory, swap or crash dumps, so complete memory
 erasure cannot be guaranteed. Files are written in one step with permissions 0600.
 
-Existing OpenPGP stores are migrated on unlock using GnuPG, when available. The new store is staged
-and activated by a directory rename; the old encrypted files remain as backups. Those backups still
-open with the old password even after changing the new store's password; handle them accordingly.
+Existing legacy OpenPGP stores are *not* migrated automatically. An old or incomplete store is
+rejected without overwriting any files; retain backups and use the older software to export it
+separately. Native LAW/LAI encrypted stores remain compatible. The =native/items/*.gpg= suffix is
+retained for filename compatibility; those files are not OpenPGP and do not require GnuPG.
 
 Which applications declare that they use secrets is kept in =apps.eld= beside it, unencrypted: it
 holds no secret, and a start reads it before it knows whether to ask for the password.
@@ -142,13 +170,44 @@ into the store, under =lispm-backend-NAME=, and =lispm-backends= is saved withou
 key is then gone from the Customize file.  Keys taken from the environment (=:key-env=), from
 auth-source, already in the store, and characters' own endpoints are left as they are.
 
-* Tests
+* Building and tests
+
+Build dependencies only: ECL and its C compiler, Python 3, static libsodium and headers;
+=install_name_tool= and =codesign= on macOS, or =patchelf= on Linux. Emacs is needed for ERT and
+strict byte compilation. No build tool is invoked by the installed client.
 
 #+begin_src sh
-make test      # run ERT; legacy tests use GnuPG if installed
-make compile   # byte-compile, failing on any warning
+make service SODIUM_PREFIX=/opt/homebrew   # /usr with distro development packages
+make crypto-test                          # fixed LAW/LAI vectors and negative cases
+make test                                 # ERT, explicitly using the built executable
+make compile                              # fail on byte-compiler warnings
+make packaging-test                       # packaging/audit tests
+make package                              # dist/ archive, no binaries tracked by git
 #+end_src
+
+=SERVICE=/absolute/path/lispm-auth-service= selects an extracted artifact for the same tests.
+The service reads one tab-separated hex request from stdin per process; no password or key is
+passed in argv, environment or temporary plaintext files. This is a compiled executable, not a
+script invoking ECL/SBCL. libsodium supplies Argon2id (64 MiB, three passes) and XChaCha20-Poly1305.
+
+The service workflow builds on macOS arm64/x86_64 and Linux x86_64, bundles recursive non-system
+runtime dependencies, audits loader references, tests extracted archives with a restricted PATH,
+and uploads archives and SHA256SUMS. A tag-triggered release is a *draft* for review, not an
+unattended publication. CI has not been run merely by adding the workflow. A restricted-PATH test
+plus loader closure audit is useful but does not replace testing on fresh supported machines.
+Linux glibc/loader and Apple system libraries remain OS dependencies; the artifacts are neither
+universal binaries nor musl/Windows distributions.
+
+Build inputs/toolchains from runner images and package repositories may change. Artifacts record
+runtime dependency origins and notices; builds are not claimed to be bit-for-bit reproducible.
+Release maintainers must review the actual workflow results, dependencies, OS baselines, full
+corresponding source availability and hashes before publishing/pinning a release. Generated
+=build/=, =dist/= and =prebuilt/= trees stay untracked; historical binaries are not removed by
+rewriting git history.
 
 * License
 
-GNU Affero General Public License, version 3 or later.  See =LICENSE=.
+GNU Affero General Public License, version 3 or later. See =LICENSE=. Bundled ECL, GMP, BDW GC
+and statically linked libsodium retain their own licenses; see the distribution's =licenses/=
+and source notices. Redistributions must preserve these notices and provide corresponding source
+and relinking rights as required by the respective licenses. macOS system libraries are not bundled.
