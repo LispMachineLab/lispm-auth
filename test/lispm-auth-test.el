@@ -156,6 +156,16 @@
                                    (lispm-auth-test--file-bytes file))))
             (directory-files-recursively directory "\\`[^.]")))
 
+(ert-deftest lispm-auth-test-bundled-module-selection ()
+  (let ((system-configuration "aarch64-apple-darwin"))
+    (should (string-suffix-p "native/prebuilt/aarch64-apple-darwin/lispm-auth-native.dylib"
+                             (lispm-auth--bundled-module))))
+  (let ((system-configuration "x86_64-apple-darwin"))
+    (should (string-suffix-p "native/prebuilt/x86_64-apple-darwin/lispm-auth-native.dylib"
+                             (lispm-auth--bundled-module))))
+  (let ((system-configuration "unknown-platform"))
+    (should-error (lispm-auth--bundled-module) :type 'lispm-auth-unavailable)))
+
 (ert-deftest lispm-auth-test-native-tamper-and-id-binding ()
   (lispm-auth-test--with-store
     (let ((lispm-auth-gpg-program "not-installed"))

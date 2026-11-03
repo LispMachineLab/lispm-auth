@@ -6,9 +6,10 @@ secrets, so that only their starts ask for the password.  In code, the prefix is
 
 * What it needs
 
-- *LispM Auth's native crypto module*, built with =make native= and supplied via
-  =lispm-auth-native-module= or the Emacs load path. Building requires Rust and Cargo; published
-  prebuilt packages are not yet available. A legacy OpenPGP store also needs GnuPG for migration.
+- *LispM Auth's native crypto module* is bundled for macOS Apple Silicon and Intel and loaded
+  automatically. Other platforms require a locally built module configured with
+  =lispm-auth-native-module=; building requires Rust and Cargo. A legacy OpenPGP store also needs
+  GnuPG for migration.
 - *LispM's core*, to ask it for a secret: the hooks are ordinary variables (=lispm-secret-get-functions=
   and the three others in =lispm-core.el=), so they may be added to before LispM is loaded.  LispM
   Auth itself works without LispM, for its two declarations' functions and its own start.

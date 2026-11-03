@@ -1221,17 +1221,34 @@ PASSPHRASE goes to GnuPG on its input, so it is not written to disk."
                     (list "--passphrase-fd" "0" "--decrypt" file))
    "the secret"))
 
+(defconst lispm-auth--package-directory
+  (file-name-directory (or load-file-name buffer-file-name))
+  "Directory holding LispM Auth and its bundled native modules.")
+
 (defcustom lispm-auth-native-module nil
-  "Absolute path to the native module, or nil to search `load-path'."
+  "Absolute path to a native module, or nil to use the bundled module.
+An explicit path is trusted and bypasses bundled module selection."
   :type '(choice (const nil) file) :group 'lispm-auth)
+
+(defun lispm-auth--bundled-module ()
+  "Return the native module bundled for this Emacs, or signal unavailable."
+  (let* ((target (cond ((string-match-p "\\`\\(aarch64\\|arm64\\)-apple-darwin" system-configuration)
+                        "aarch64-apple-darwin")
+                       ((string-match-p "\\`x86_64-apple-darwin" system-configuration)
+                        "x86_64-apple-darwin")
+                       (t (signal 'lispm-auth-unavailable
+                                  (list (format "No bundled module for %s" system-configuration))))))
+         (file (expand-file-name (concat "native/prebuilt/" target "/lispm-auth-native.dylib")
+                                 lispm-auth--package-directory)))
+    (unless (file-readable-p file)
+      (signal 'lispm-auth-unavailable (list (format "Bundled module missing: %s" file))))
+    file))
 
 (defun lispm-auth--native ()
   "Load the native crypto module or signal unavailable."
   (unless (fboundp 'lispm-auth-native-random-key)
     (condition-case err
-        (if lispm-auth-native-module
-            (module-load lispm-auth-native-module)
-          (require 'lispm-auth-native))
+        (module-load (or lispm-auth-native-module (lispm-auth--bundled-module)))
       (error (signal 'lispm-auth-unavailable (list (error-message-string err))))))
   (unless (and (fboundp 'lispm-auth-native-random-key)
                (fboundp 'lispm-auth-native-wrap-key)
