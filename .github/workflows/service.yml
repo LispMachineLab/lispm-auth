@@ -28,13 +28,14 @@ jobs:
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install ecl libsodium pkgconf
+          brew install ecl libsodium pkgconf texinfo
+          echo "$(brew --prefix texinfo)/bin" >> "$GITHUB_PATH"
           echo "SODIUM_PREFIX=$(brew --prefix libsodium)" >> "$GITHUB_ENV"
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ecl libecl-dev libgc-dev libgmp-dev libffi-dev libsodium-dev patchelf pkg-config build-essential libncurses-dev zlib1g-dev
+          sudo apt-get install -y ecl libecl-dev libgc-dev libgmp-dev libffi-dev libsodium-dev patchelf pkg-config build-essential libncurses-dev zlib1g-dev libgnutls28-dev texinfo
           mkdir -p build/sodium/lib build/sodium/include
           cp /usr/lib/x86_64-linux-gnu/libsodium.a build/sodium/lib/
           cp -R /usr/include/sodium /usr/include/sodium.h build/sodium/include/
