@@ -30,16 +30,6 @@
 (require 'cl-lib)
 (require 'lispm-auth)
 
-;; The native module may be installed on `load-path'; allow a local build too.
-(unless lispm-auth-native-module
-  (let* ((root (file-name-directory (directory-file-name
-                                      (file-name-directory (or load-file-name buffer-file-name)))))
-         (candidates (append
-                      (file-expand-wildcards (expand-file-name "native/target/*/debug/liblispm_auth_native.*" root))
-                      (file-expand-wildcards (expand-file-name "native/target/debug/liblispm_auth_native.*" root)))))
-    (setq lispm-auth-native-module
-          (seq-find (lambda (file) (string-suffix-p module-file-suffix file)) candidates))))
-
 ;; LispM's own, in lispm-core.el; dynamic here so a test may give the
 ;; migration backends of its own.
 (defvar lispm-backends)
@@ -156,15 +146,55 @@
                                    (lispm-auth-test--file-bytes file))))
             (directory-files-recursively directory "\\`[^.]")))
 
-(ert-deftest lispm-auth-test-bundled-module-selection ()
-  (let ((system-configuration "aarch64-apple-darwin"))
-    (should (string-suffix-p "native/prebuilt/aarch64-apple-darwin/lispm-auth-native.dylib"
-                             (lispm-auth--bundled-module))))
-  (let ((system-configuration "x86_64-apple-darwin"))
-    (should (string-suffix-p "native/prebuilt/x86_64-apple-darwin/lispm-auth-native.dylib"
-                             (lispm-auth--bundled-module))))
-  (let ((system-configuration "unknown-platform"))
-    (should-error (lispm-auth--bundled-module) :type 'lispm-auth-unavailable)))
+(defmacro lispm-auth-test--fake-service (code &rest body)
+  "Run BODY with a Python process emitting CODE instead of the service."
+  (declare (indent 1))
+  `(let ((original (symbol-function 'make-process)))
+     (cl-letf (((symbol-function 'make-process)
+                (lambda (&rest args)
+                  (setq args (plist-put args :command
+                                        (list (or (executable-find "python3")
+                                                  (ert-skip "Python unavailable"))
+                                              "-c" ,code)))
+                  (apply original args))))
+       ,@body)))
+
+(ert-deftest lispm-auth-test-service-framing-and-limits ()
+  (dolist (response '("ok\t00\nextra" "ok\t0\n" "ok\tXX\n" "ok\t00" "error\nextra"))
+    (lispm-auth-test--fake-service
+        (format "import sys; sys.stdin.readline(); sys.stdout.write(%S)" response)
+      (should-error (lispm-auth--service "random") :type 'lispm-auth-unavailable)))
+  (let ((lispm-auth-service-output-limit 32))
+    (lispm-auth-test--fake-service
+        "import sys; sys.stdin.readline(); sys.stdout.write('x'*10000)"
+      (should-error (lispm-auth--service "random") :type 'lispm-auth-unavailable)))
+  (let ((lispm-auth-service-timeout 0.1))
+    (lispm-auth-test--fake-service "import time; time.sleep(10)"
+      (should-error (lispm-auth--service "random") :type 'lispm-auth-unavailable))))
+
+(ert-deftest lispm-auth-test-service-failures-not-wrong-password ()
+  (lispm-auth-test--with-store
+    (make-directory (file-name-directory (lispm-auth-key-file)) t)
+    (lispm-auth--write-ciphertext "bad" (lispm-auth-key-file))
+    (should-error (lispm-auth--read-data-key "password") :type 'lispm-auth-error)
+    (lispm-auth--write-ciphertext (concat "4c415701" (make-string 176 ?0))
+                                  (lispm-auth-key-file))
+    (let ((lispm-auth-lisp-program "no-such-lisp-executable"))
+      (should-error (lispm-auth--read-data-key "password") :type 'lispm-auth-unavailable))))
+
+(ert-deftest lispm-auth-test-service-quit-cleans-processes ()
+  (let ((original (symbol-function 'make-process)) (child nil))
+    (cl-letf (((symbol-function 'make-process)
+               (lambda (&rest args)
+                 (setq args (plist-put args :command
+                                       (list (executable-find "python3") "-c"
+                                             "import time; time.sleep(10)")))
+                 (setq child (apply original args))))
+              ((symbol-function 'accept-process-output)
+               (lambda (&rest _) (signal 'quit nil))))
+      (should (eq 'quit (condition-case nil (lispm-auth--service "random")
+                          (quit 'quit))))
+      (should-not (process-live-p child)))))
 
 (ert-deftest lispm-auth-test-native-tamper-and-id-binding ()
   (lispm-auth-test--with-store
@@ -194,7 +224,7 @@
         (lispm-auth--write-ciphertext (lispm-auth--encrypt-with (prin1-to-string '("id" . "secret")) old-key) item)
         (let ((original (lispm-auth-test--file-bytes item)))
           (should-error (lispm-auth--open "wrong") :type 'lispm-auth-wrong-password)
-          (cl-letf (((symbol-function 'lispm-auth-native-wrap-key) (lambda (&rest _) (error "failure"))))
+          (cl-letf (((symbol-function 'lispm-auth--write-data-key) (lambda (&rest _) (error "failure"))))
             (should-error (lispm-auth--open "hunter2")))
           (should-not (file-exists-p (lispm-auth-key-file)))
           (should (equal original (lispm-auth-test--file-bytes item)))
@@ -287,7 +317,7 @@
       (lispm-auth-test--make-store "hunter2" (cons "id" "sk-secret"))
       (let ((before (lispm-auth-test--file-bytes
                      (lispm-auth--item-file "id"))))
-        (cl-letf (((symbol-function 'lispm-auth-native-encrypt-item)
+        (cl-letf (((symbol-function 'lispm-auth--service)
                    (lambda (&rest _) (error "No room"))))
           (should-error (lispm-auth--set "id" "sk-new")))
         (should (equal (lispm-auth-test--file-bytes
@@ -496,7 +526,7 @@ asks for a new one on the page."
       (lispm-auth-test--make-store "hunter2" (cons "id" "sk-secret"))
       (let ((before (lispm-auth-test--file-bytes (lispm-auth-key-file))))
         (setq lispm-auth-test--answers '("hunter2"))
-        (cl-letf (((symbol-function 'lispm-auth-native-wrap-key)
+        (cl-letf (((symbol-function 'lispm-auth--write-data-key)
                    (lambda (&rest _) (error "No room"))))
           (should-error (lispm-auth-change-password "another")))
         (should lispm-auth--data-key)

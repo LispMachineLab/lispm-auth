@@ -6,10 +6,11 @@ secrets, so that only their starts ask for the password.  In code, the prefix is
 
 * What it needs
 
-- *LispM Auth's native crypto module* is bundled for macOS Apple Silicon and Intel and loaded
-  automatically. Other platforms require a locally built module configured with
-  =lispm-auth-native-module=; building requires Rust and Cargo. A legacy OpenPGP store also needs
-  GnuPG for migration.
+- *SBCL, CFFI and libsodium*: the Common Lisp service uses libsodium for password derivation and
+  authenticated encryption. CFFI and its dependencies must be visible to ASDF without SBCL init
+  files; for example, set =CL_SOURCE_REGISTRY= to include the Quicklisp software directory before
+  starting Emacs. LispM Auth does not bundle these runtime dependencies; a legacy OpenPGP store
+  also needs GnuPG for migration.
 - *LispM's core*, to ask it for a secret: the hooks are ordinary variables (=lispm-secret-get-functions=
   and the three others in =lispm-core.el=), so they may be added to before LispM is loaded.  LispM
   Auth itself works without LispM, for its two declarations' functions and its own start.
@@ -144,7 +145,7 @@ auth-source, already in the store, and characters' own endpoints are left as the
 * Tests
 
 #+begin_src sh
-make test      # build the native module and run ERT; legacy tests use GnuPG if installed
+make test      # run ERT; legacy tests use GnuPG if installed
 make compile   # byte-compile, failing on any warning
 #+end_src
 

@@ -27,8 +27,8 @@
 ;;; Commentary:
 
 ;; LispM Auth is where LispM keeps the API keys its backends ask with.
-;; The keys are encrypted at rest by the native authenticated-crypto
-;; module, in a store opened by a password once a session.  A key is
+;; The keys are encrypted at rest by the Common Lisp authenticated-crypto
+;; service, in a store opened by a password once a session.  A key is
 ;; never written in plaintext: each secret is authenticated independently
 ;; and written in one step.  GnuPG is needed only for legacy migration.
 ;;
@@ -97,12 +97,6 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'subr-x)
-
-(declare-function lispm-auth-native-random-key "lispm-auth-native" ())
-(declare-function lispm-auth-native-wrap-key "lispm-auth-native" (key password))
-(declare-function lispm-auth-native-unwrap-key "lispm-auth-native" (blob password))
-(declare-function lispm-auth-native-encrypt-item "lispm-auth-native" (key id plaintext))
-(declare-function lispm-auth-native-decrypt-item "lispm-auth-native" (key id blob))
 
 (declare-function lispm-backend-secret-id "lispm-settings" (name))
 (declare-function lispm-settings-set "lispm-settings" (variable value &optional save))
@@ -317,7 +311,7 @@ store counts: opening it moves it to the keyed form."
 
 (define-error 'lispm-auth-error "LispM Auth error")
 (define-error 'lispm-auth-wrong-password "Wrong password" 'lispm-auth-error)
-(define-error 'lispm-auth-unavailable "GnuPG is not available" 'lispm-auth-error)
+(define-error 'lispm-auth-unavailable "LispM Auth service is not available" 'lispm-auth-error)
 
 ;;;; Reading what applications declare
 
@@ -1223,39 +1217,77 @@ PASSPHRASE goes to GnuPG on its input, so it is not written to disk."
 
 (defconst lispm-auth--package-directory
   (file-name-directory (or load-file-name buffer-file-name))
-  "Directory holding LispM Auth and its bundled native modules.")
+  "Directory holding LispM Auth and its Common Lisp service.")
 
-(defcustom lispm-auth-native-module nil
-  "Absolute path to a native module, or nil to use the bundled module.
-An explicit path is trusted and bypasses bundled module selection."
-  :type '(choice (const nil) file) :group 'lispm-auth)
+(defcustom lispm-auth-lisp-program "sbcl"
+  "SBCL executable used to run the crypto service."
+  :type 'string :group 'lispm-auth)
 
-(defun lispm-auth--bundled-module ()
-  "Return the native module bundled for this Emacs, or signal unavailable."
-  (let* ((target (cond ((string-match-p "\\`\\(aarch64\\|arm64\\)-apple-darwin" system-configuration)
-                        "aarch64-apple-darwin")
-                       ((string-match-p "\\`x86_64-apple-darwin" system-configuration)
-                        "x86_64-apple-darwin")
-                       (t (signal 'lispm-auth-unavailable
-                                  (list (format "No bundled module for %s" system-configuration))))))
-         (file (expand-file-name (concat "native/prebuilt/" target "/lispm-auth-native.dylib")
-                                 lispm-auth--package-directory)))
-    (unless (file-readable-p file)
-      (signal 'lispm-auth-unavailable (list (format "Bundled module missing: %s" file))))
-    file))
+(defcustom lispm-auth-service-timeout 30
+  "Maximum seconds for one crypto service request."
+  :type 'number :group 'lispm-auth)
 
-(defun lispm-auth--native ()
-  "Load the native crypto module or signal unavailable."
-  (unless (fboundp 'lispm-auth-native-random-key)
-    (condition-case err
-        (module-load (or lispm-auth-native-module (lispm-auth--bundled-module)))
-      (error (signal 'lispm-auth-unavailable (list (error-message-string err))))))
-  (unless (and (fboundp 'lispm-auth-native-random-key)
-               (fboundp 'lispm-auth-native-wrap-key)
-               (fboundp 'lispm-auth-native-unwrap-key)
-               (fboundp 'lispm-auth-native-encrypt-item)
-               (fboundp 'lispm-auth-native-decrypt-item))
-    (signal 'lispm-auth-unavailable '("Incomplete native module"))))
+(defcustom lispm-auth-service-output-limit (* 4 1024 1024)
+  "Maximum bytes accepted from the crypto service."
+  :type 'integer :group 'lispm-auth)
+
+(define-error 'lispm-auth-service-error "Crypto service rejected request" 'lispm-auth-error)
+(define-error 'lispm-auth-service-auth-error "Crypto authentication failed" 'lispm-auth-service-error)
+
+(defun lispm-auth--service (operation &rest fields)
+  "Send OPERATION and hexadecimal FIELDS to a fresh crypto process.
+Return its hexadecimal result.  Never retain or display its stderr."
+  (let* ((program (and (stringp lispm-auth-lisp-program)
+                       (executable-find lispm-auth-lisp-program)))
+         (script (expand-file-name "common-lisp/service.lisp" lispm-auth--package-directory))
+         (request (concat (mapconcat #'identity (cons operation fields) "\t") "\n"))
+         (output "") (overflow nil) (process nil) (stderr-process nil))
+    (unless (and program (file-readable-p script))
+      (signal 'lispm-auth-unavailable '("Crypto service is unavailable")))
+    (unwind-protect
+        (with-timeout (lispm-auth-service-timeout
+                       (signal 'lispm-auth-unavailable '("Crypto service timed out")))
+          (condition-case nil
+              (progn
+                (setq stderr-process
+                      (make-pipe-process :name "lispm-auth-stderr" :buffer nil
+                                         :noquery t :coding 'no-conversion
+                                         :filter (lambda (_process _data) nil)))
+                (setq process
+                      (make-process
+                       :name "lispm-auth-service" :buffer nil :noquery t
+                       :connection-type 'pipe :coding 'no-conversion
+                       :command (list program "--noinform" "--script" script)
+                       :stderr stderr-process
+                       :sentinel #'ignore
+                       :filter (lambda (_process data)
+                                 (if (> (+ (length output) (length data))
+                                        lispm-auth-service-output-limit)
+                                     (setq overflow t)
+                                   (setq output (concat output data))))))
+                (process-send-string process request)
+                (process-send-eof process)
+                (while (and (process-live-p process) (not overflow))
+                  (accept-process-output process 0.1))
+                ;; Drain any output delivered with process termination.
+                (while (and (not overflow) (accept-process-output process 0.01)))
+                (unless (and (not overflow) (eq (process-status process) 'exit)
+                             (= (process-exit-status process) 0))
+                  (signal 'lispm-auth-unavailable '("Crypto service failed")))
+                (cond ((equal output "error\tauth\n")
+                       (signal 'lispm-auth-service-auth-error nil))
+                      ((member output '("error\tinvalid\n" "error\tinternal\n"))
+                       (signal 'lispm-auth-service-error nil))
+                      ((and (string-match "\\`ok\t\\([0-9a-f]*\\)\n\\'" output)
+                            (zerop (% (length (match-string 1 output)) 2)))
+                       (match-string 1 output))
+                      (t (signal 'lispm-auth-unavailable '("Invalid crypto service response")))))
+            (file-error (signal 'lispm-auth-unavailable '("Crypto service could not start")))))
+      (let ((inhibit-quit t))
+        (when (processp process) (delete-process process))
+        (when (processp stderr-process) (delete-process stderr-process))
+        (clear-string request)
+        (clear-string output)))))
 
 (defun lispm-auth--hex (text)
   (mapconcat (lambda (byte) (format "%02x" byte))
@@ -1272,8 +1304,7 @@ An explicit path is trusted and bypasses bundled module selection."
    'utf-8-unix))
 
 (defun lispm-auth--new-data-key ()
-  (lispm-auth--native)
-  (lispm-auth-native-random-key))
+  (lispm-auth--service "random"))
 
 ;;;; The store's contents
 
@@ -1321,20 +1352,21 @@ A failure leaves FILE as it was."
         (ignore-errors (delete-file temporary))))))
 
 (defun lispm-auth--read-data-key (password)
-  (lispm-auth--native)
   (let ((blob (with-temp-buffer
                 (insert-file-contents-literally (lispm-auth-key-file))
                 (buffer-string))))
+    (unless (string-match-p "\\`4c415701[0-9a-f]\\{176\\}\\'" blob)
+      (signal 'lispm-auth-error '("Invalid wrapped key")))
     (condition-case nil
-        (lispm-auth-native-unwrap-key blob password)
-      (error (signal 'lispm-auth-wrong-password nil)))))
+        (lispm-auth--service "unwrap" blob (lispm-auth--hex password))
+      ;; Authentication failure also covers an intact-looking corrupted key.
+      (lispm-auth-service-auth-error (signal 'lispm-auth-wrong-password nil)))))
 
 (defun lispm-auth--write-data-key (key password)
-  (lispm-auth--native)
   (let* ((file (lispm-auth-key-file))
          (directory (file-name-directory file))
          (new-directory (not (file-exists-p directory)))
-         (wrapped (lispm-auth-native-wrap-key key password))
+         (wrapped (lispm-auth--service "wrap" key (lispm-auth--hex password)))
          (written nil))
     (unwind-protect
         (progn
@@ -1347,7 +1379,6 @@ A failure leaves FILE as it was."
 
 (defun lispm-auth--migrate-store (password)
   "Migrate a legacy store atomically, retaining all legacy files."
-  (lispm-auth--native)
   (let* ((legacy-key (expand-file-name "key.gpg" lispm-auth-directory))
          (legacy-items (expand-file-name "secrets" lispm-auth-directory))
          (key (lispm-auth--new-data-key))
@@ -1418,10 +1449,9 @@ place is not read as the secret asked for."
 (defun lispm-auth--read-item (id)
   (let ((file (lispm-auth--item-file id)))
     (when (file-exists-p file)
-      (lispm-auth--native)
       (let* ((blob (with-temp-buffer (insert-file-contents-literally file) (buffer-string)))
              (text (lispm-auth--unhex
-                    (lispm-auth-native-decrypt-item lispm-auth--data-key
+                    (lispm-auth--service "decrypt" lispm-auth--data-key
                                                     (lispm-auth--hex (lispm-auth--id id)) blob)))
              (read-eval nil)
              (pair (car (read-from-string text))))
@@ -1447,7 +1477,7 @@ place is not read as the secret asked for."
       (make-directory directory t)
       (ignore-errors (set-file-modes directory #o700)))
     (lispm-auth--write-ciphertext
-     (lispm-auth-native-encrypt-item lispm-auth--data-key
+     (lispm-auth--service "encrypt" lispm-auth--data-key
                                     (lispm-auth--hex id)
                                     (lispm-auth--hex (lispm-auth--item-text id secret)))
      file)
@@ -1740,8 +1770,8 @@ Return non-nil when it was there."
 
 (defun lispm-auth--secret-available ()
   "Return non-nil when LispM Auth can keep secrets here.
-That is: this file is loaded, and GnuPG is here to encrypt them with."
-  (condition-case nil (progn (lispm-auth--native) t) (error nil)))
+That is: the Common Lisp crypto service can run."
+  (condition-case nil (progn (lispm-auth--new-data-key) t) (error nil)))
 
 (defun lispm-auth--gpg-program-p ()
   "Return non-nil when the GnuPG program LispM Auth uses is here."
