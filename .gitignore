@@ -1,0 +1,3 @@
+*.elc
+/.deps/
+/native/target/

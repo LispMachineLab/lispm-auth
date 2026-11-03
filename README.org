@@ -1,0 +1,152 @@
+#+title: LispM Auth
+
+LispM's secrets, encrypted and opened with a password, for any Emacs 30.1 or later: the store LispM
+and LispM Desktop keep their API keys in, and the declarations that say which applications use
+secrets, so that only their starts ask for the password.  In code, the prefix is =lispm-auth-=.
+
+* What it needs
+
+- *LispM Auth's native crypto module*, built with =make native= and supplied via
+  =lispm-auth-native-module= or the Emacs load path. Building requires Rust and Cargo; published
+  prebuilt packages are not yet available. A legacy OpenPGP store also needs GnuPG for migration.
+- *LispM's core*, to ask it for a secret: the hooks are ordinary variables (=lispm-secret-get-functions=
+  and the three others in =lispm-core.el=), so they may be added to before LispM is loaded.  LispM
+  Auth itself works without LispM, for its two declarations' functions and its own start.
+
+* The store
+
+The store generates a random 256-bit data key. Argon2id derives a wrapping key from the password
+and a random salt, and XChaCha20-Poly1305 authenticates the wrapped key and each individual secret.
+Each secret's ID is authenticated as associated data. The files are under
+=~/.emacs.d/lispm-auth/native/=; opening the store keeps the data key in memory and decrypts each
+secret on demand. Passwords, keys and plaintext are not deliberately written to disk unencrypted.
+Emacs and the operating system may retain copies in memory, swap or crash dumps, so complete memory
+erasure cannot be guaranteed. Files are written in one step with permissions 0600.
+
+Existing OpenPGP stores are migrated on unlock using GnuPG, when available. The new store is staged
+and activated by a directory rename; the old encrypted files remain as backups. Those backups still
+open with the old password even after changing the new store's password; handle them accordingly.
+
+Which applications declare that they use secrets is kept in =apps.eld= beside it, unencrypted: it
+holds no secret, and a start reads it before it knows whether to ask for the password.
+
+* Changing the password, and locking
+
+#+begin_src emacs-lisp
+(lispm-auth-change-password)            ; the page asks for a new password twice
+(lispm-auth-change-password "…")        ; or take one already given
+(lispm-auth-lock)                       ; forget the data key
+#+end_src
+
+=lispm-auth-change-password= first asks for the password the store has — even when the store is
+already open — and checks it against the store, so that a password given wrongly changes nothing.
+It then wraps the data key with a key derived from the new password, in one step; no secret is encrypted again,
+so the secrets' files do not change at all.  A store not made yet is made with the new password.
+=lispm-auth-lock= touches no file: it forgets the data key, and the next use asks for the password
+again.
+
+An open store also locks itself when it has not been used for =lispm-auth-auto-lock= minutes: 5, 15,
+30 (the default), 60, 240 or 1440, or nil to never lock by itself.  A secret read, stored or deleted
+begins the time again.  The lock is a timer, and using the store after Emacs was busy or asleep
+checks the clock too, so a store never outlives its time.
+
+#+begin_src emacs-lisp
+(setq lispm-auth-auto-lock 15)          ; or Customize, or Control Panels
+#+end_src
+
+Control Panels has the password change and the lock, in its *Security* panel, beside the declaration
+for the Desktop:
+
+* Opening it at startup
+
+An application starts with
+
+#+begin_src emacs-lisp
+(lispm-auth-start-apps '(desktop lispm))   ; or (lispm-auth-start-app 'desktop)
+#+end_src
+
+and the store opens only when at least one of them declares that it uses secrets.  It asks for the
+password once, keeps the data key while the store is open, and a wrong password is asked for again
+(=lispm-auth-password-attempts= times at most).  With no store yet, the first declaring start
+asks for a new password, and asks for it twice: the page is then titled *Set a Password*.  Once a
+store exists, the page is titled with the application's name and asks for the password the store
+has.  A start of applications that declare nothing asks nothing, and touches none of the encrypted
+data.  When the store locks itself after =lispm-auth-auto-lock= minutes, the next start asks for the
+password again.
+
+The password is asked for on a page of its own, not in the minibuffer.  A desktop that draws its own
+pages may draw it as a window in LispM's own frame, in the desktop's colours and with its content
+centred as a group (=lispm-auth-page-window-draw-function=); the frame keeps its size and place, and
+its windows and colours are put back when the store is open.  That window is the one that sets a new
+password and the one that confirms it, as the setup assistant's pages are, and the whole flow that
+changes the password, which Control Panels keeps.  LispM's own start asks for the password the store
+has across the whole window instead, in a page of its own drawing: it fills the window, not the
+screen.  An application opened on its own asks in a window too, and says so by setting
+=lispm-auth-page-windowed= for its start.  Without a drawing desktop, as in a terminal (=emacs -nw=),
+the page fills the frame all the same, and the password is masked all the same.  =RET= confirms,
+=Esc= cancels and leaves the store closed; a wrong password is said so on the page, which asks
+again; a new password that differs from its second entry is said so too.  On the page that asks for
+the password the store has, =C-p= replaces that password: the page asks for the old one, opens the
+store with it, then asks for the new one twice and wraps the data key with a newly derived key.
+The page closes as soon as the store is open, and is not shown again in a session in which the
+store is already open, nor when every application that started has revoked its declaration.
+
+An application opened on its own, from Finder or the Dock, starts LispM out of sight, and its
+bundle names it on the command line, =--lispm-app=KEY=.  Its page is a window too: a frame LispM
+started out of sight is shown while the page asks, and hidden again with it.  Only that application
+is judged: one that declares nothing, a game say, shows no page and opens nothing.  LispM and LispM
+Agent always declare; their starts, and Focus Mode, name =lispm= itself, so revoking the desktop's
+declaration does not keep their page away.
+
+* What declares
+
+| application | declares                                        |
+|-------------+-------------------------------------------------|
+| =lispm=     | always; a request to say otherwise is refused   |
+| =desktop=   | by default, until Control Panels revokes it     |
+| any other   | only when it was told to                        |
+
+Control Panels changes a declaration with the two functions LispM Auth publishes for it:
+
+#+begin_src emacs-lisp
+(lispm-auth-app-requires-password-p 'desktop)        ; => t, unless revoked
+(lispm-auth-set-app-requires-password 'desktop nil)  ; revoke it, for later starts
+(lispm-auth-set-app-requires-password 'terminal t)   ; another application opts in
+#+end_src
+
+The declaration is kept in =apps.eld=, so it is in force at the next start.
+
+* How LispM asks for a secret
+
+LispM keeps no secret itself; it asks a store through four hooks, and LispM Auth adds their handlers
+when it loads:
+
+| hook                            | handler                                                      |
+|---------------------------------+--------------------------------------------------------------|
+| =lispm-secret-get-functions=    | =(ID NO-PROMPT)= the secret, or nil                          |
+| =lispm-secret-set-functions=    | =(ID SECRET)= non-nil when stored                            |
+| =lispm-secret-delete-functions= | =(ID)= non-nil when removed                                  |
+| =lispm-secret-available-functions= | =()= non-nil when a store is here                         |
+
+NO-PROMPT non-nil is how a window showing how a backend stands reads a key: while the store is
+locked the handler answers nil and asks for nothing, touching none of the encrypted data.  A
+backend names its key =:key (secret . ID)=; =lispm-backend-secret-id= names one
+=lispm-backend-NAME=.
+
+* Moving a key out of your Customize file
+
+The first time the store opens in a session, a backend whose =:key= is a literal string has it moved
+into the store, under =lispm-backend-NAME=, and =lispm-backends= is saved without it; the plaintext
+key is then gone from the Customize file.  Keys taken from the environment (=:key-env=), from
+auth-source, already in the store, and characters' own endpoints are left as they are.
+
+* Tests
+
+#+begin_src sh
+make test      # build the native module and run ERT; legacy tests use GnuPG if installed
+make compile   # byte-compile, failing on any warning
+#+end_src
+
+* License
+
+GNU Affero General Public License, version 3 or later.  See =LICENSE=.
