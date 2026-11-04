@@ -30,9 +30,8 @@ class PackagingTests(unittest.TestCase):
                                       ("Advanced Micro Devices X86-64", "x86_64")):
             with self.subTest(machine=machine), patch.object(pkg, "run", return_value=self.elf_header(machine)):
                 self.assertEqual(pkg.binary_platform(Path("service"), "linux"), "linux-" + architecture)
-        for architecture in ("arm64", "x86_64"):
-            with self.subTest(architecture=architecture), patch.object(pkg, "run", return_value=architecture):
-                self.assertEqual(pkg.binary_platform(Path("service"), "darwin"), "darwin-" + architecture)
+        with patch.object(pkg, "run", return_value="arm64"):
+            self.assertEqual(pkg.binary_platform(Path("service"), "darwin"), "darwin-arm64")
 
     def test_binary_platform_rejects_unsupported_or_ambiguous_headers(self):
         for header in ("", "ELF Header:\n  Machine: AArch64\n", self.elf_header("RISC-V"),
@@ -41,17 +40,33 @@ class PackagingTests(unittest.TestCase):
             with self.subTest(header=header), patch.object(pkg, "run", return_value=header):
                 with self.assertRaises(pkg.PackagingError):
                     pkg.binary_platform(Path("service"), "linux")
-        for architectures in ("", "arm64 x86_64", "arm64e", "i386"):
+        for architectures in ("", "x86_64", "arm64 x86_64", "arm64e", "i386"):
             with self.subTest(architectures=architectures), patch.object(pkg, "run", return_value=architectures):
                 with self.assertRaises(pkg.PackagingError):
                     pkg.binary_platform(Path("service"), "darwin")
 
     def test_explicit_platform_requires_matching_architecture(self):
-        for platform in ("linux-x86_64", "darwin-x86_64"):
-            output = self.elf_header() if platform.startswith("linux") else "arm64"
+        for platform in ("linux-x86_64", "darwin-arm64"):
+            output = self.elf_header() if platform.startswith("linux") else "arm64 x86_64"
             with self.subTest(platform=platform), patch.object(pkg, "run", return_value=output):
-                with self.assertRaisesRegex(pkg.PackagingError, "architecture mismatch"):
+                with self.assertRaisesRegex(pkg.PackagingError, "architecture mismatch|Unsupported/ambiguous|Intel macOS is no longer supported"):
                     pkg.check_platform(Path("service"), platform)
+
+    def test_intel_macos_packaging_rejected_before_bundling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "service"
+            binary.touch()
+            with patch.object(pkg.sys, "platform", "darwin"), \
+                 patch.object(pkg, "run", return_value="x86_64"), \
+                 patch.object(pkg, "MacBundler") as bundler, \
+                 patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                self.assertEqual(pkg.main(["--binary", str(binary), "--output", str(Path(tmp) / "out"),
+                                           "--version", "test"]), 1)
+                self.assertIn("Intel macOS is no longer supported", stderr.getvalue())
+                bundler.assert_not_called()
+                self.assertFalse((Path(tmp) / "out").exists())
+                with self.assertRaises(SystemExit), patch("sys.stderr", new_callable=io.StringIO):
+                    pkg.main(["--audit", tmp, "--platform", "darwin-x86_64"])
 
     def test_linux_arm64_main_packages_explicit_and_inferred_platform(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -125,13 +140,13 @@ class PackagingTests(unittest.TestCase):
                 bundler.platform, bundler.root = platform, root
                 bundler.copied = {dependency: dependency}
                 with self.subTest(platform=platform), patch.object(pkg, "run", return_value=header):
-                    with self.assertRaisesRegex(pkg.PackagingError, "architecture mismatch"):
+                    with self.assertRaisesRegex(pkg.PackagingError, "architecture mismatch|Unsupported/ambiguous|Intel macOS is no longer supported"):
                         if klass is pkg.MacBundler:
                             bundler.visit(dependency, root / "copy", [])
                         else:
                             bundler.visit(dependency, root / "copy")
                     self.assertFalse((root / "copy").exists())
-                    with self.assertRaisesRegex(pkg.PackagingError, "architecture mismatch"):
+                    with self.assertRaisesRegex(pkg.PackagingError, "architecture mismatch|Unsupported/ambiguous|Intel macOS is no longer supported"):
                         bundler.audit()
 
     def test_dependency_allowlist(self):

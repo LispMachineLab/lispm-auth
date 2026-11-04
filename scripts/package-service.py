@@ -30,7 +30,7 @@ SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+)+(?:[-A-Za-z0-9.]*)$")
 # Deliberately small baseline: other libraries need explicit license coverage.
 GLIBC = re.compile(r"^(?:lib(?:c|m|pthread|dl|rt|resolv|util|anl)\.so\.[0-9]+|ld-linux[^/]*\.so\.[0-9]+)$")
-PLATFORMS = ("darwin-arm64", "darwin-x86_64", "linux-arm64", "linux-x86_64")
+PLATFORMS = ("darwin-arm64", "linux-arm64", "linux-x86_64")
 
 
 class PackagingError(RuntimeError):
@@ -51,8 +51,10 @@ def binary_platform(path: Path, host_os: str) -> str:
     """Identify one supported 64-bit architecture, never defaulting to x86_64."""
     if host_os == "darwin":
         architectures = run("lipo", "-archs", path).split()
-        if len(architectures) == 1 and architectures[0] in {"arm64", "x86_64"}:
-            return "darwin-" + architectures[0]
+        if architectures == ["arm64"]:
+            return "darwin-arm64"
+        if architectures == ["x86_64"]:
+            raise PackagingError(f"Intel macOS is no longer supported: {path}")
         raise PackagingError(f"Unsupported/ambiguous Mach-O architecture in {path}: {architectures}")
     if host_os == "linux":
         header = run("readelf", "-h", path)

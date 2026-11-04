@@ -11,8 +11,8 @@
     (should (and archive (file-regular-p archive)))
     (should (equal lispm-auth-service-version version))
     (should (equal (lispm-auth--service-platform) platform))
-    (should (= (length lispm-auth-service-sha256) 4))
-    (dolist (name '("darwin-arm64" "darwin-x86_64" "linux-x86_64" "linux-arm64"))
+    (should (= (length lispm-auth-service-sha256) 3))
+    (dolist (name '("darwin-arm64" "linux-x86_64" "linux-arm64"))
       (should (string-match-p "\\`[0-9a-f]\\{64\\}\\'"
                               (cdr (assoc name lispm-auth-service-sha256)))))
     (let* ((root (make-temp-file "lispm-auth-release-" t))

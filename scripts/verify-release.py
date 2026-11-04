@@ -12,7 +12,7 @@ def verify(root):
     version = manifest["version"]
     if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", version):
         raise ValueError("Invalid release version")
-    platforms = {"darwin-arm64", "darwin-x86_64", "linux-x86_64", "linux-arm64"}
+    platforms = {"darwin-arm64", "linux-x86_64", "linux-arm64"}
     if set(manifest["service_sha256"]) != platforms:
         raise ValueError("Incomplete platform set")
     expected = {f"lispm-auth-service-{version}-{p}.tar.gz" for p in platforms}

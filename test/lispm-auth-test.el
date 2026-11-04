@@ -211,7 +211,7 @@ An explicitly supplied but invalid executable is an error, not a skip."
   "Recognize ARM64 aliases without treating other architectures as supported."
   (dolist (case '((darwin "aarch64-apple-darwin" "darwin-arm64")
                   (darwin "arm64-apple-darwin" "darwin-arm64")
-                  (darwin "x86_64-apple-darwin" "darwin-x86_64")
+                  (darwin "x86_64-apple-darwin" nil)
                   (gnu/linux "aarch64-unknown-linux-gnu" "linux-arm64")
                   (gnu/linux "arm64-unknown-linux-gnu" "linux-arm64")
                   (gnu/linux "x86_64-pc-linux-gnu" "linux-x86_64")
@@ -220,6 +220,26 @@ An explicitly supplied but invalid executable is an error, not a skip."
     (let ((system-type (nth 0 case))
           (system-configuration (nth 1 case)))
       (should (equal (lispm-auth--service-platform) (nth 2 case))))))
+
+(ert-deftest lispm-auth-test-intel-macos-unsupported ()
+  "Intel macOS cannot install or run a service, even with an explicit path."
+  (let ((system-type 'darwin)
+        (system-configuration "x86_64-apple-darwin")
+        (lispm-auth-service-program "/usr/bin/true"))
+    (should-not (lispm-auth--service-platform))
+    (should-not (assoc "darwin-x86_64" lispm-auth-service-sha256))
+    (cl-letf (((symbol-function 'lispm-auth--download-service)
+               (lambda (&rest _) (ert-fail "Unexpected download")))
+              ((symbol-function 'lispm-auth--extract-service)
+               (lambda (&rest _) (ert-fail "Unexpected extraction")))
+              ((symbol-function 'make-process)
+               (lambda (&rest _) (ert-fail "Unexpected process"))))
+      (dolist (operation (list #'lispm-auth--service-program
+                              #'lispm-auth-install-service
+                              (lambda () (lispm-auth--service "random"))))
+        (let ((failure (should-error (funcall operation) :type 'lispm-auth-unavailable)))
+          (should (string-match-p "Intel macOS is no longer supported"
+                                  (error-message-string failure))))))))
 
 (ert-deftest lispm-auth-test-linux-arm64-package-artifact ()
   "ARM64 Linux resolves local prebuilt artifacts without needing a release pin."
