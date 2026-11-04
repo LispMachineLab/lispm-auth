@@ -991,6 +991,45 @@ cleared as the page closes would encrypt NUL characters instead."
                         (string-match-p "Enter the new password again" text))
                       lispm-auth-test--page-texts))))
 
+(ert-deftest lispm-auth-test-page-mouse-actions ()
+  (let ((page (list :stage 'new :confirm t :password "one" :first nil
+                    :message nil :done nil :result nil))
+        (action 'confirm)
+        (click '(mouse-1 (nil 1 (10 . 20) 0))))
+    (cl-letf (((symbol-function 'lispm-auth--page-windowed-p) (lambda (_) t))
+              ((symbol-function 'lispm-auth--page-redraw) #'ignore))
+      (let ((lispm-auth-page-window-event-function
+             (lambda (_page event) (should (equal event click)) action)))
+        (lispm-auth--page-handle page click)
+        (should (eq (plist-get page :stage) 'again))
+        (setf (plist-get page :password) "one")
+        (lispm-auth--page-handle page click)
+        (should (equal (plist-get page :result) "one"))
+        (should (plist-get page :done))
+        (setf (plist-get page :done) nil
+              (plist-get page :result) nil)
+        (setq action nil)
+        (lispm-auth--page-handle page click)
+        (should-not (plist-get page :done))
+        (setq action 'cancel)
+        (lispm-auth--page-handle page click)
+        (should (plist-get page :done))
+        (should-not (plist-get page :result))))))
+
+(ert-deftest lispm-auth-test-change-page-stages ()
+  (let ((lispm-auth--changing t)
+        (lispm-auth--page-show-function
+         (lambda (page)
+           (should (eq (plist-get page :operation) 'change))
+           (should (eq (plist-get page :stage) 'current))))
+        (lispm-auth--page-hide-function #'ignore)
+        (lispm-auth--page-event-function (lambda () 'cancel)))
+    (should-not (lispm-auth--page-read "LispM password: " nil nil)))
+  (let ((page (list :stage 'current :password "old" :done nil :result nil)))
+    (lispm-auth--page-submit page)
+    (should (equal (plist-get page :result) "old"))
+    (should (plist-get page :done))))
+
 (ert-deftest lispm-auth-test-page-asks-again-after-a-wrong-password ()
   "A wrong password is said so on the page, and asked for again."
   (lispm-auth-test--with-service
@@ -1547,6 +1586,54 @@ gone, so that nothing drifts across the page behind it."
                            (point-min) (point-max)
                            'lispm-auth-page-field-image nil)))))
       (kill-buffer buffer))))
+
+(ert-deftest lispm-auth-test-change-idle-time-reschedules ()
+  (let ((lispm-auth--unlocked t)
+        (lispm-auth--data-key nil)
+        (lispm-auth--last-use (time-subtract (current-time) (seconds-to-time 120)))
+        (lispm-auth--lock-timer nil)
+        (lispm-auth-auto-lock nil))
+    (unwind-protect
+        (progn
+          (lispm-auth-set-auto-lock 5)
+          (should (timerp lispm-auth--lock-timer))
+          (lispm-auth-set-auto-lock nil)
+          (should-not lispm-auth--lock-timer)
+          (lispm-auth-set-auto-lock 1)
+          (should-not lispm-auth--unlocked))
+      (lispm-auth--cancel-lock-timer))))
+
+(ert-deftest lispm-auth-test-unlock-checks-idle-expiration ()
+  (let ((lispm-auth--unlocked t)
+        (lispm-auth--data-key nil)
+        (lispm-auth--last-use (time-subtract (current-time) (seconds-to-time 120)))
+        (lispm-auth--lock-timer nil)
+        (lispm-auth-auto-lock 1))
+    (cl-letf (((symbol-function 'lispm-auth--check-store-format) #'ignore)
+              ((symbol-function 'lispm-auth-store-exists-p) (lambda () t))
+              ((symbol-function 'lispm-auth--unlock-file) (lambda () nil)))
+      (should-not (lispm-auth-unlock))
+      (should-not lispm-auth--unlocked))))
+
+(ert-deftest lispm-auth-test-early-timer-rearms-after-extension ()
+  (let ((lispm-auth--unlocked t)
+        (lispm-auth--data-key nil)
+        (lispm-auth--last-use (time-subtract (current-time) (seconds-to-time 60)))
+        (lispm-auth--lock-timer nil)
+        (lispm-auth-auto-lock 5))
+    (unwind-protect
+        (progn
+          (lispm-auth--auto-lock)
+          (should lispm-auth--unlocked)
+          (should (timerp lispm-auth--lock-timer)))
+      (lispm-auth--cancel-lock-timer))))
+
+(ert-deftest lispm-auth-test-first-password-is-setup-operation ()
+  (let ((lispm-auth-password-function
+         (lambda (&rest _) (should-not lispm-auth--changing) nil)))
+    (cl-letf (((symbol-function 'lispm-auth--check-store-format) #'ignore)
+              ((symbol-function 'lispm-auth-store-exists-p) #'ignore))
+      (should-error (lispm-auth-change-password) :type 'user-error))))
 
 (provide 'lispm-auth-test)
 ;;; lispm-auth-test.el ends here

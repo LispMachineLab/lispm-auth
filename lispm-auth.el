@@ -445,9 +445,30 @@ key.  nil while the store is locked, and no secret is read then.")
 
 (defun lispm-auth--auto-lock ()
   "Lock the store when `lispm-auth-auto-lock' has run out."
-  (when (and lispm-auth--unlocked (lispm-auth--expired-p))
-    (lispm-auth-lock)
-    (message "LispM Auth: the store is locked again")))
+  (when lispm-auth--unlocked
+    (if (lispm-auth--expired-p)
+        (progn (lispm-auth-lock)
+               (message "LispM Auth: the store is locked again"))
+      (lispm-auth--reschedule-auto-lock))))
+
+(defun lispm-auth--reschedule-auto-lock ()
+  "Schedule the lock according to the time remaining since last use."
+  (lispm-auth--cancel-lock-timer)
+  (when-let* ((seconds (lispm-auth--auto-lock-seconds))
+              (lispm-auth--unlocked)
+              (lispm-auth--last-use))
+    (let ((remaining (- seconds (float-time (time-since lispm-auth--last-use)))))
+      (if (<= remaining 0)
+          (lispm-auth-lock)
+        (setq lispm-auth--lock-timer
+              (run-with-timer remaining nil #'lispm-auth--auto-lock))))))
+
+(defun lispm-auth-set-auto-lock (minutes)
+  "Set the idle lock time to MINUTES, or nil to disable it."
+  (unless (or (null minutes) (and (numberp minutes) (> minutes 0)))
+    (error "Auto-lock time must be positive or nil"))
+  (setq lispm-auth-auto-lock minutes)
+  (lispm-auth--reschedule-auto-lock))
 
 (defun lispm-auth--touch ()
   "Note that the store was used, and begin its time again."
@@ -518,6 +539,12 @@ drawn on the frame LispM started in, as the setup assistant's pages are;
 the frame keeps the size and place it has.  PAGE's buffer is current and
 empty, and its frame is shown; the function fills it and returns.  The
 desktop sets this; nil draws every page the built-in way.")
+
+(defvar lispm-auth-page-window-event-function nil
+  "Translate a windowed password PAGE's mouse EVENT into an action.
+Called with PAGE and EVENT for a primary-button click, when the desktop's
+window drawing is in use.  Return `confirm', `cancel', or nil.  The
+renderer is responsible for hit-testing the event in the page's window.")
 
 (defvar lispm-auth-page-windowed nil
   "Non-nil when every password page is drawn as a window.
@@ -612,6 +639,7 @@ underscores, which every terminal shows."
 (defun lispm-auth--page-placeholder (page)
   "Return the word PAGE's empty field shows, before a key is typed."
   (pcase (plist-get page :stage)
+    ('current "Current password")
     ('new "New password")
     ('again "Enter it again")
     (_ "LispM password")))
@@ -721,6 +749,7 @@ along that way it is, from 0 to 1."
                   ('new (format "Choose a password for %s's secrets.  It is asked for at each start."
                                 (lispm-auth--page-app-name)))
                   ('again "It is asked for at each start.")
+                  ('current "Return verifies the current password.")
                   (_ "Return opens the store."))
                 'face 'lispm-auth-page-hint)))
 
@@ -989,7 +1018,7 @@ stead.  Nothing is drawn where a display cannot show the logo."
                 "Choose a password for LispM's secrets."
               "Type the password."))
       (lispm-auth--page-redraw page))
-     ((eq stage 'single)
+     ((memq stage '(single current))
       (setf (plist-get page :result) password)
       (lispm-auth--page-slide page)
       (setf (plist-get page :done) t))
@@ -1013,9 +1042,13 @@ stead.  Nothing is drawn where a display cannot show the logo."
         (lispm-auth--page-redraw page))))))
 
 (defun lispm-auth--page-handle (page event)
-  "Answer PAGE's EVENT: a character of the password, Return, or Escape."
+  "Answer PAGE's EVENT: a character, keyboard action, or window click."
+  (when (and (consp event) (eq (car event) 'mouse-1)
+             lispm-auth-page-window-event-function
+             (lispm-auth--page-windowed-p page))
+    (setq event (funcall lispm-auth-page-window-event-function page event)))
   (cond
-   ((or (eq event 'return) (eq event 'kp-enter)
+   ((or (eq event 'confirm) (eq event 'return) (eq event 'kp-enter)
         (eql event ?\r) (eql event ?\n))
     (lispm-auth--page-submit page))
    ((or (eq event 'escape) (eq event 'cancel)
@@ -1041,7 +1074,12 @@ password, or nil when Escape was pressed."
   (let ((page (list :prompt prompt
                     :confirm (and confirm t)
                     :message message
-                    :stage (if confirm 'new 'single)
+                    :operation (cond (lispm-auth--changing 'change)
+                                     (confirm 'setup)
+                                     (t 'unlock))
+                    :stage (cond (confirm 'new)
+                                 (lispm-auth--changing 'current)
+                                 (t 'single))
                     ;; Changing it is offered only where a password is
                     ;; already set, and not again while it is being changed.
                     :change (and (not confirm)
@@ -1564,6 +1602,7 @@ Return non-nil when it is open, nil when the user gave no password.
 Make a store with a new password when there is none yet.  Signal
 `user-error' when the password given is not the store's."
   (lispm-auth--check-store-format)
+  (lispm-auth--lock-if-stale)
   (if lispm-auth--unlocked
       t
     (let ((opened (if (lispm-auth-store-exists-p)
@@ -1618,9 +1657,10 @@ again: no secret is encrypted anew.  Return non-nil when the password
 changed."
   (interactive)
   (lispm-auth--check-store-format)
-  (let ((lispm-auth--changing t)
-        (key nil))
-    (when (lispm-auth-store-exists-p)
+  (let* ((store-exists (lispm-auth-store-exists-p))
+         (lispm-auth--changing store-exists)
+         (key nil))
+    (when store-exists
       (unless (if lispm-auth--unlocked
                   (lispm-auth--check-current-password)
                 (lispm-auth-unlock))
