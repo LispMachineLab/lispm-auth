@@ -4,7 +4,7 @@
 
 ;; Author: Ryan.K
 ;; URL: https://github.com/LispMachineLab/lispm-auth
-;; Version: 0.1.0
+;; Version: 0.2.1
 ;; Package-Requires: ((emacs "30.1"))
 ;; Keywords: tools, data
 ;; SPDX-License-Identifier: AGPL-3.0-or-later
@@ -1097,9 +1097,12 @@ shell, Lisp interpreter, or source-file fallback is used."
 (defconst lispm-auth-service-version "v0.2.0"
   "Fixed service release used by this client; never a moving latest URL.")
 
-(defconst lispm-auth-service-sha256 nil
+(defconst lispm-auth-service-sha256
+  '(("darwin-arm64" . "f5e5a8308f3ab745bef0654ce07ffaebb9ee1b503f8c83c4bd558224349968bf")
+    ("darwin-x86_64" . "231924ec7573a575aa51fde23be9318ab198146c51962c16275cb3106589f7bc")
+    ("linux-x86_64" . "77364fa76e1a2ae5f7a5a13b43d3ed6f45479ca84fc844f612481e1fd9e0be33"))
   "Alist of (PLATFORM . SHA256) pins for the fixed service release.
-Empty until release assets have been built and independently verified.
+Published assets were independently verified against the tested CI artifacts.
 Never obtain trusted hashes from the same download as the executable.")
 
 (defcustom lispm-auth-service-directory (locate-user-emacs-file "lispm-auth-service/")

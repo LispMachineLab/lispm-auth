@@ -34,11 +34,13 @@ package or opening a store never downloads anything. With a local release archiv
 (lispm-auth-install-service "/path/to/lispm-auth-service-v0.2.0-darwin-arm64.tar.gz")
 #+end_src
 
-*Publication status:* no verified release hashes are recorded in this source yet. Until the CI
-artifacts are built, tested, published and their actual hashes reviewed and pinned in a subsequent
-client update, the installer fails clearly *before any network request*. It does not invent hashes,
-trust a checksum downloaded alongside an executable, or fall back to installing build tools.
-A developer-built service can be selected explicitly while release publication is pending.
+*Publication status:* service =v0.2.0= is published with verified archives for all three supported
+platforms. Client =0.2.1= pins the actual published archive hashes, independently checked against the tested CI
+artifacts. Run =M-x lispm-auth-install-service= for the explicit, confirmed download. The tagged
+=v0.2.0= client predates these pins; use this updated client or configure a verified prebuilt archive.
+The release also provides project and dependency source archives, vendor patches and rebuild/relink
+instructions. The installer never trusts a checksum fetched alongside the executable as its sole
+verification or falls back to installing build tools.
 
 macOS bundles are ad-hoc signed for loader integrity, not Developer ID signed or notarized.
 Gatekeeper/download quarantine may require your distribution's normal signing and notarization
