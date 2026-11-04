@@ -21,6 +21,119 @@ SPEC.loader.exec_module(pkg)
 
 
 class PackagingTests(unittest.TestCase):
+    @staticmethod
+    def elf_header(machine="AArch64", elf_class="ELF64", data="2's complement, little endian"):
+        return f"ELF Header:\n  Class: {elf_class}\n  Data: {data}\n  Machine: {machine}\n"
+
+    def test_binary_platform_recognizes_supported_architectures(self):
+        for machine, architecture in (("AArch64", "arm64"),
+                                      ("Advanced Micro Devices X86-64", "x86_64")):
+            with self.subTest(machine=machine), patch.object(pkg, "run", return_value=self.elf_header(machine)):
+                self.assertEqual(pkg.binary_platform(Path("service"), "linux"), "linux-" + architecture)
+        for architecture in ("arm64", "x86_64"):
+            with self.subTest(architecture=architecture), patch.object(pkg, "run", return_value=architecture):
+                self.assertEqual(pkg.binary_platform(Path("service"), "darwin"), "darwin-" + architecture)
+
+    def test_binary_platform_rejects_unsupported_or_ambiguous_headers(self):
+        for header in ("", "ELF Header:\n  Machine: AArch64\n", self.elf_header("RISC-V"),
+                       self.elf_header(elf_class="ELF32"), self.elf_header(data="2's complement, big endian"),
+                       self.elf_header() + "  Machine: Advanced Micro Devices X86-64\n"):
+            with self.subTest(header=header), patch.object(pkg, "run", return_value=header):
+                with self.assertRaises(pkg.PackagingError):
+                    pkg.binary_platform(Path("service"), "linux")
+        for architectures in ("", "arm64 x86_64", "arm64e", "i386"):
+            with self.subTest(architectures=architectures), patch.object(pkg, "run", return_value=architectures):
+                with self.assertRaises(pkg.PackagingError):
+                    pkg.binary_platform(Path("service"), "darwin")
+
+    def test_explicit_platform_requires_matching_architecture(self):
+        for platform in ("linux-x86_64", "darwin-x86_64"):
+            output = self.elf_header() if platform.startswith("linux") else "arm64"
+            with self.subTest(platform=platform), patch.object(pkg, "run", return_value=output):
+                with self.assertRaisesRegex(pkg.PackagingError, "architecture mismatch"):
+                    pkg.check_platform(Path("service"), platform)
+
+    def test_linux_arm64_main_packages_explicit_and_inferred_platform(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            binary = base / "service"
+            binary.touch()
+            for explicit in (False, True):
+                output = base / str(explicit)
+                args = ["--binary", str(binary), "--output", str(output), "--version", "test"]
+                if explicit:
+                    args.extend(["--platform", "linux-arm64"])
+                with self.subTest(explicit=explicit), patch.object(pkg.sys, "platform", "linux"), \
+                     patch.object(pkg, "run", return_value=self.elf_header()), \
+                     patch.object(pkg, "LinuxBundler") as bundler, \
+                     patch.object(pkg, "licenses", return_value=[]), \
+                     patch("sys.stdout", new_callable=io.StringIO):
+                    bundler.return_value.bundle.return_value = []
+                    self.assertEqual(pkg.main(args), 0)
+                    self.assertTrue((output / "lispm-auth-service-test-linux-arm64.tar.gz").is_file())
+
+    def test_main_rejects_mismatched_explicit_platform_before_bundling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "service"
+            binary.touch()
+            for platform in ("linux-x86_64", "darwin-arm64"):
+                with self.subTest(platform=platform), patch.object(pkg.sys, "platform", "linux"), \
+                     patch.object(pkg, "run", return_value=self.elf_header()), \
+                     patch.object(pkg, "LinuxBundler") as bundler, \
+                     patch("sys.stderr", new_callable=io.StringIO):
+                    self.assertEqual(pkg.main(["--binary", str(binary), "--output", str(Path(tmp) / "out"),
+                                               "--version", "test", "--platform", platform]), 1)
+                    bundler.assert_not_called()
+
+    def test_audit_honors_explicit_platform(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / pkg.NAME).touch()
+            with patch.object(pkg.sys, "platform", "linux"), \
+                 patch.object(pkg, "run", return_value=self.elf_header()), \
+                 patch.object(pkg, "LinuxBundler") as bundler, \
+                 patch("sys.stderr", new_callable=io.StringIO):
+                self.assertEqual(pkg.main(["--audit", str(root), "--platform", "linux-x86_64"]), 1)
+                bundler.assert_not_called()
+
+    def test_linux_resolution_skips_wrong_architecture_and_class(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidates = [root / name for name in ("32bit", "x86_64", "arm64")]
+            for path in candidates:
+                path.touch()
+            bundler = pkg.LinuxBundler.__new__(pkg.LinuxBundler)
+            bundler.platform = "linux-arm64"
+            bundler.cache = {"libgc.so.1": candidates}
+            headers = [self.elf_header(elf_class="ELF32"),
+                       self.elf_header("Advanced Micro Devices X86-64"), self.elf_header()]
+            with patch.object(pkg, "run", side_effect=headers):
+                self.assertEqual(bundler.resolve("libgc.so.1", root / "service", []), candidates[-1].resolve())
+            with patch.object(pkg, "run", return_value=self.elf_header("Advanced Micro Devices X86-64")):
+                with self.assertRaisesRegex(pkg.PackagingError, "Unresolved ELF dependency"):
+                    bundler.resolve("libgc.so.1", root / "service", [])
+
+    def test_bundlers_reject_wrong_architecture_dependencies_and_audits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dependency = root / "libgc.so.1"
+            dependency.touch()
+            for klass, platform, header in ((pkg.LinuxBundler, "linux-arm64",
+                                              self.elf_header("Advanced Micro Devices X86-64")),
+                                             (pkg.MacBundler, "darwin-arm64", "x86_64")):
+                bundler = klass.__new__(klass)
+                bundler.platform, bundler.root = platform, root
+                bundler.copied = {dependency: dependency}
+                with self.subTest(platform=platform), patch.object(pkg, "run", return_value=header):
+                    with self.assertRaisesRegex(pkg.PackagingError, "architecture mismatch"):
+                        if klass is pkg.MacBundler:
+                            bundler.visit(dependency, root / "copy", [])
+                        else:
+                            bundler.visit(dependency, root / "copy")
+                    self.assertFalse((root / "copy").exists())
+                    with self.assertRaisesRegex(pkg.PackagingError, "architecture mismatch"):
+                        bundler.audit()
+
     def test_dependency_allowlist(self):
         for library, expected in (("libecl.26.5.dylib", "ecl"), ("libgmp.so.10", "gmp"),
                                   ("libgc.1.dylib", "bdw-gc"), ("libsodium.so.23", "libsodium"),
@@ -87,13 +200,14 @@ Load command 3
             binary = root / pkg.NAME
             binary.touch()
             bundler = pkg.MacBundler.__new__(pkg.MacBundler)
-            bundler.root, bundler.copied = root, {binary: binary}
+            bundler.root, bundler.copied, bundler.platform = root, {binary: binary}, "darwin-arm64"
             for deps, rpaths in ((["/opt/homebrew/lib/libgc.dylib"], []),
                                  (["@rpath/libgc.dylib"], []),
                                  (["@loader_path/lib/missing.dylib"], []),
                                  (["@loader_path/../../libgc.dylib"], []),
                                  ([], ["/opt/homebrew/lib"])):
-                with patch.object(pkg, "mac_info", return_value=(deps, rpaths, None)):
+                with patch.object(pkg, "mac_info", return_value=(deps, rpaths, None)), \
+                     patch.object(pkg, "check_platform"):
                     with self.assertRaises(pkg.PackagingError):
                         bundler.audit()
 
@@ -104,11 +218,13 @@ Load command 3
             binary.touch()
             bundler = pkg.LinuxBundler.__new__(pkg.LinuxBundler)
             bundler.root, bundler.copied, bundler.cache = root, {binary: binary}, {}
+            bundler.platform = "linux-arm64"
             for deps, rpaths in ((["/opt/homebrew/lib/libgc.so.1"], ["$ORIGIN/lib"]),
                                  (["libgc.so.1"], ["$ORIGIN/lib"]),
                                  ([], ["$ORIGIN/lib", "/usr/local/lib"]),
                                  ([], ["$ORIGIN/../outside"])):
-                with patch.object(bundler, "info", return_value=(deps, rpaths)):
+                with patch.object(bundler, "info", return_value=(deps, rpaths)), \
+                     patch.object(pkg, "check_platform"):
                     with self.assertRaises(pkg.PackagingError):
                         bundler.audit()
 

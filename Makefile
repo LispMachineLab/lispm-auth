@@ -4,6 +4,7 @@ PYTHON ?= python3
 SODIUM_PREFIX ?= /usr
 SERVICE ?= $(CURDIR)/build/lispm-auth-service
 VERSION ?= v0.2.0
+PLATFORM ?=
 LOAD_PATH = -L .
 FILES = lispm-auth.el
 
@@ -27,7 +28,7 @@ packaging-test:
 	$(PYTHON) -m unittest discover -s test -p 'test_*.py'
 
 package:
-	$(PYTHON) scripts/package-service.py --binary "$(SERVICE)" --version "$(VERSION)" --output dist
+	$(PYTHON) scripts/package-service.py --binary "$(SERVICE)" --version "$(VERSION)" $(if $(PLATFORM),--platform "$(PLATFORM)") --output dist
 
 # Remove compiled files so checkout loads cannot shadow the sources.
 compile:
