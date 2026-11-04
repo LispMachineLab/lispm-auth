@@ -1,0 +1,293 @@
+name: Recover v0.2.3 with Rosetta Intel validation
+
+on:
+  push:
+    branches: [fix/rosetta-release-recovery]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish only after complete four-platform validation
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: recover-v0.2.3-rosetta
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 07c0bfb46453332613300055f3135f56cec04cde
+          fetch-depth: 0
+      - name: Validate version and release ancestry
+        id: version
+        shell: bash
+        run: |
+          VERSION=v0.2.3
+          EXPECTED=07c0bfb46453332613300055f3135f56cec04cde
+          test "$(git rev-parse HEAD)" = "$EXPECTED"
+          test "$(git rev-parse "refs/tags/$VERSION^{commit}")" = "$EXPECTED"
+          git merge-base --is-ancestor "$EXPECTED" origin/main
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            platform: darwin-arm64
+          - runner: macos-15
+            platform: darwin-x86_64
+          - runner: ubuntu-22.04
+            platform: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 07c0bfb46453332613300055f3135f56cec04cde
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS' && matrix.platform != 'darwin-x86_64'
+        shell: bash
+        run: |
+          if [[ "$PLATFORM" == darwin-x86_64 && "$(uname -m)" != x86_64 ]]; then
+            exec arch -x86_64 /bin/bash --noprofile --norc -eo pipefail "$0"
+          fi
+          brew install ecl libsodium pkgconf
+          echo "SODIUM_PREFIX=$(brew --prefix libsodium)" >> "$GITHUB_ENV"
+      - name: Install build dependencies and source indexes (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if [[ "$PLATFORM" == darwin-x86_64 && "$(uname -m)" != x86_64 ]]; then
+            exec arch -x86_64 /bin/bash --noprofile --norc -eo pipefail "$0"
+          fi
+          # Mirror the runner's authenticated binary repositories, including
+          # Ubuntu ports on ARM64, rather than assuming amd64 archive URLs.
+          sudo python3 - <<'PY'
+          from pathlib import Path
+          sources = Path('/etc/apt/sources.list')
+          if sources.exists():
+              lines = sources.read_text().splitlines()
+              sources.write_text('\n'.join(lines + [line.replace('deb ', 'deb-src ', 1) for line in lines if line.startswith('deb ')]) + '\n')
+          for path in Path('/etc/apt/sources.list.d').glob('*.sources'):
+              path.write_text(path.read_text().replace('Types: deb\n', 'Types: deb deb-src\n'))
+          PY
+          sudo apt-get update
+          sudo apt-get install -y ecl libecl-dev libgc-dev libgmp-dev libffi-dev libsodium-dev patchelf pkg-config build-essential dpkg-dev
+          mkdir -p build/sodium/lib build/sodium/include
+          cp "/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/libsodium.a" build/sodium/lib/
+          cp -R /usr/include/sodium /usr/include/sodium.h build/sodium/include/
+          echo "SODIUM_PREFIX=$PWD/build/sodium" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        if: matrix.platform == 'darwin-x86_64'
+        with:
+          ref: ${{ github.sha }}
+          path: recovery-tools
+      - uses: actions/cache@v4
+        if: matrix.platform == 'darwin-x86_64'
+        id: intel-emacs
+        with:
+          path: ${{ runner.temp }}/emacs-x86_64
+          key: emacs-30.1-zlib-macos15-x86_64-rosetta-v1
+      - name: Set up isolated Intel toolchain under Rosetta
+        if: matrix.platform == 'darwin-x86_64'
+        env:
+          EMACS_CACHE_HIT: ${{ steps.intel-emacs.outputs.cache-hit }}
+        shell: bash
+        run: |
+          if [[ "$PLATFORM" == darwin-x86_64 && "$(uname -m)" != x86_64 ]]; then
+            exec arch -x86_64 /bin/bash --noprofile --norc -eo pipefail "$0"
+          fi
+          /bin/bash recovery-tools/scripts/setup-rosetta.sh
+      - uses: ./.github/actions/setup-emacs
+        if: matrix.platform != 'darwin-x86_64'
+      - name: Build and test sources
+        shell: bash
+        run: |
+          if [[ "$PLATFORM" == darwin-x86_64 && "$(uname -m)" != x86_64 ]]; then
+            exec arch -x86_64 /bin/bash --noprofile --norc -eo pipefail "$0"
+          fi
+          make service
+          make crypto-test test compile packaging-test
+      - name: Package runtime closure
+        shell: bash
+        run: |
+          if [[ "$PLATFORM" == darwin-x86_64 && "$(uname -m)" != x86_64 ]]; then
+            exec arch -x86_64 /bin/bash --noprofile --norc -eo pipefail "$0"
+          fi
+          make package VERSION="$VERSION" PLATFORM="$PLATFORM"
+      - name: Test relocated release in restricted environment
+        shell: bash
+        run: |
+          if [[ "$PLATFORM" == darwin-x86_64 && "$(uname -m)" != x86_64 ]]; then
+            exec arch -x86_64 /bin/bash --noprofile --norc -eo pipefail "$0"
+          fi
+          mkdir -p build/relocated build/empty-home
+          tar -xzf "dist/lispm-auth-service-$VERSION-$PLATFORM.tar.gz" -C build/relocated
+          python3 scripts/package-service.py --audit build/relocated --platform "$PLATFORM"
+          env -i HOME="$PWD/build/empty-home" PATH=/usr/bin:/bin \
+            LISPM_AUTH_SERVICE="$PWD/build/relocated/lispm-auth-service" \
+            "$(command -v python3)" common-lisp/test.py
+          env -i HOME="$PWD/build/empty-home" PATH=/usr/bin:/bin \
+            LISPM_AUTH_SERVICE="$PWD/build/relocated/lispm-auth-service" \
+            LISPM_AUTH_RELEASE_ARCHIVE="$PWD/dist/lispm-auth-service-$VERSION-$PLATFORM.tar.gz" \
+            "$(command -v emacs)" -Q --batch -L . \
+            --eval '(setq native-comp-enable-subr-trampolines nil)' \
+            -l test/lispm-auth-test.el -l test/lispm-auth-install-test.el \
+            -f ert-run-tests-batch-and-exit
+      - name: Collect exact corresponding dependency sources
+        shell: bash
+        run: |
+          if [[ "$PLATFORM" == darwin-x86_64 && "$(uname -m)" != x86_64 ]]; then
+            exec arch -x86_64 /bin/bash --noprofile --norc -eo pipefail "$0"
+          fi
+          python3 scripts/collect-release-sources.py --runtime build/relocated \
+            --platform "$PLATFORM" --output "dist/lispm-auth-$VERSION-$PLATFORM-dependency-sources.tar.gz"
+          python3 -c 'import hashlib,pathlib; pathlib.Path("dist/SHA256SUMS").write_text("".join(hashlib.sha256(p.read_bytes()).hexdigest()+"  "+p.name+"\n" for p in sorted(pathlib.Path("dist").glob("*.tar.gz"))))'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: service-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  assemble:
+    needs: [prepare, build]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 07c0bfb46453332613300055f3135f56cec04cde
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: service-*
+      - name: Generate pinned client and complete release
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          python3 scripts/assemble-release.py --inputs artifacts --output release \
+            --version "$VERSION" --commit "$(git rev-parse HEAD)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-candidate
+          path: release/*
+          if-no-files-found: error
+
+  verify-client:
+    needs: [prepare, assemble]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            platform: darwin-arm64
+          - runner: macos-15
+            platform: darwin-x86_64
+          - runner: ubuntu-22.04
+            platform: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 07c0bfb46453332613300055f3135f56cec04cde
+      - uses: actions/checkout@v4
+        if: matrix.platform == 'darwin-x86_64'
+        with:
+          ref: ${{ github.sha }}
+          path: recovery-tools
+      - uses: actions/cache@v4
+        if: matrix.platform == 'darwin-x86_64'
+        id: intel-emacs
+        with:
+          path: ${{ runner.temp }}/emacs-x86_64
+          key: emacs-30.1-zlib-macos15-x86_64-rosetta-v1
+      - name: Set up isolated Intel toolchain under Rosetta
+        if: matrix.platform == 'darwin-x86_64'
+        env:
+          EMACS_CACHE_HIT: ${{ steps.intel-emacs.outputs.cache-hit }}
+        shell: bash
+        run: |
+          if [[ "$PLATFORM" == darwin-x86_64 && "$(uname -m)" != x86_64 ]]; then
+            exec arch -x86_64 /bin/bash --noprofile --norc -eo pipefail "$0"
+          fi
+          /bin/bash recovery-tools/scripts/setup-rosetta.sh
+      - uses: ./.github/actions/setup-emacs
+        if: matrix.platform != 'darwin-x86_64'
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-candidate
+          path: release
+      - name: Verify actual generated client pins and native install
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PLATFORM: ${{ matrix.platform }}
+        shell: bash
+        run: |
+          if [[ "$PLATFORM" == darwin-x86_64 && "$(uname -m)" != x86_64 ]]; then
+            exec arch -x86_64 /bin/bash --noprofile --norc -eo pipefail "$0"
+          fi
+          python3 scripts/verify-release.py release
+          mkdir client
+          tar -xzf "release/lispm-auth-client-${VERSION#v}.tar.gz" -C client --strip-components=1
+          cd client
+          mkdir -p build/empty-home
+          env -i HOME="$PWD/build/empty-home" PATH=/usr/bin:/bin \
+            LISPM_AUTH_RELEASE_ARCHIVE="$GITHUB_WORKSPACE/release/lispm-auth-service-$VERSION-$PLATFORM.tar.gz" \
+            LISPM_AUTH_EXPECTED_VERSION="$VERSION" \
+            LISPM_AUTH_EXPECTED_PLATFORM="$PLATFORM" \
+            "$(command -v emacs)" -Q --batch -L . \
+            --eval '(setq native-comp-enable-subr-trampolines nil)' \
+            -l test/lispm-auth-release-test.el -f ert-run-tests-batch-and-exit
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    needs: [prepare, verify-client]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 07c0bfb46453332613300055f3135f56cec04cde
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-candidate
+          path: release
+      - name: Verify candidate again
+        run: python3 scripts/verify-release.py release
+      - name: Publish new immutable version automatically
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: v0.2.3
+        shell: bash
+        run: |
+          git fetch origin refs/tags/v0.2.3:refs/tags/v0.2.3
+          test "$(git rev-parse "refs/tags/v0.2.3^{commit}")" = 07c0bfb46453332613300055f3135f56cec04cde
+          # A failed lookup is not proof of absence: listing must succeed.
+          gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '.[].tag_name' > existing-tags
+          if grep -Fxq "$RELEASE_TAG" existing-tags; then
+            echo "Refusing to overwrite an existing public or draft release" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" release/* --verify-tag \
+            --title "LispM Auth $RELEASE_TAG" --notes-file release/RELEASE-NOTES.md
