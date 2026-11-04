@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import tarfile
 
-PLATFORMS = ("darwin-arm64", "darwin-x86_64", "linux-x86_64", "linux-arm64")
+PLATFORMS = ("darwin-arm64", "linux-x86_64", "linux-arm64")
 
 
 def digest(path):
@@ -45,7 +45,7 @@ def write_archive(path, files, prefix):
 
 def stamp_client(text, version, pins):
     if set(pins) != set(PLATFORMS) or any(not re.fullmatch(r"[0-9a-f]{64}", p) for p in pins.values()):
-        raise ValueError("Exactly four verified service pins required")
+        raise ValueError("Exactly three verified service pins required")
     replacements = [
         (r"^;; Version: .+$", ";; Version: " + version[1:]),
         (r'\(defconst lispm-auth-service-version "[^"]+"',
@@ -87,7 +87,7 @@ def assemble(inputs, output, source, version, commit):
         raise ValueError("Refusing to overwrite release directory")
     expected_dirs = {"service-" + p for p in PLATFORMS}
     if {p.name for p in inputs.iterdir()} != expected_dirs:
-        raise ValueError("Exactly four platform artifacts are required")
+        raise ValueError("Exactly three platform artifacts are required")
     pins = {}
     assets = []
     for platform in PLATFORMS:
@@ -132,9 +132,9 @@ def assemble(inputs, output, source, version, commit):
     (output / "RELEASE-MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n")
     (output / "RELEASE-NOTES.md").write_text(
         f"LispM Auth {version}\n\nBuilt and tested by CI from {commit}.\n\n"
-        "Use the lispm-auth-client archive: its generated lispm-auth.el pins these exact four service archives. "
+        "Use the lispm-auth-client archive: its generated lispm-auth.el pins these exact three service archives. "
         "The bare git tag is build input and does not contain the post-build pins.\n\n"
-        "Platforms: macOS 14 ARM64, macOS 15 Intel, Ubuntu 22.04 x86_64, Ubuntu 24.04 ARM64 (glibc). "
+        "Platforms: macOS 14 ARM64, Ubuntu 22.04 x86_64, Ubuntu 24.04 ARM64 (glibc). Intel macOS is no longer supported. "
         "Older systems, musl and Windows are not supported. macOS signatures are ad-hoc, not notarized.\n\n"
         "Each platform dependency-sources archive contains SOURCE-PROVENANCE.json, exact vendor sources/patches "
         "and BUILD-AND-RELINK.txt. The project source archive contains build scripts and license. "

@@ -1137,7 +1137,6 @@ shell, Lisp interpreter, or source-file fallback is used."
 
 (defconst lispm-auth-service-sha256
   '(("darwin-arm64" . "f5e5a8308f3ab745bef0654ce07ffaebb9ee1b503f8c83c4bd558224349968bf")
-    ("darwin-x86_64" . "231924ec7573a575aa51fde23be9318ab198146c51962c16275cb3106589f7bc")
     ("linux-x86_64" . "77364fa76e1a2ae5f7a5a13b43d3ed6f45479ca84fc844f612481e1fd9e0be33"))
   "Alist of (PLATFORM . SHA256) pins for the fixed service release.
 Published assets were independently verified against the tested CI artifacts.
@@ -1161,12 +1160,21 @@ This is separate from the encrypted store.  Loading LispM Auth never downloads."
                     ((string-match-p "\\`x86_64" system-configuration)
                      "x86_64"))))
     (let ((platform (and os arch (concat os "-" arch))))
-      (and (member platform '("darwin-arm64" "darwin-x86_64" "linux-arm64" "linux-x86_64"))
+      (and (member platform '("darwin-arm64" "linux-arm64" "linux-x86_64"))
            platform))))
+
+(defun lispm-auth--require-service-platform ()
+  "Return the supported platform, or explain why the service is unavailable."
+  (or (lispm-auth--service-platform)
+      (signal 'lispm-auth-unavailable
+              (list (if (and (eq system-type 'darwin)
+                             (string-match-p "\\`x86_64" system-configuration))
+                        "Intel macOS is no longer supported; use native ARM64 Emacs on Apple Silicon"
+                      "Unsupported platform; supported platforms are macOS ARM64, Linux x86_64 and Linux ARM64")))))
 
 (defun lispm-auth--service-program ()
   "Resolve the standalone service executable, or signal unavailability."
-  (let* ((platform (lispm-auth--service-platform))
+  (let* ((platform (lispm-auth--require-service-platform))
          (packaged (and platform
                         (expand-file-name
                          (concat "prebuilt/" platform "/lispm-auth-service")
@@ -1262,7 +1270,7 @@ Interactively download only after confirmation; ARCHIVE supplies a local
 release archive instead.  No valid pin means no network or extraction.
 An existing installation is never overwritten."
   (interactive)
-  (let* ((platform (lispm-auth--service-platform))
+  (let* ((platform (lispm-auth--require-service-platform))
          (pin (cdr (assoc platform lispm-auth-service-sha256)))
          (destination (and platform (lispm-auth--installed-service-directory platform))))
     (unless (and platform (stringp pin)

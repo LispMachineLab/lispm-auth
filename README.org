@@ -15,10 +15,13 @@ secrets, so that only their starts ask for the password.  In code, the prefix is
 
 * Installing the service
 
-The CI release targets are =darwin-arm64= (macOS 14), =darwin-x86_64= (macOS 15),
+The official CI release targets are =darwin-arm64= (macOS 14),
 =linux-x86_64= (glibc, Ubuntu 22.04) and =linux-arm64= (glibc, Ubuntu 24.04).
+Intel Macs are no longer supported. Intel Emacs under Rosetta is also unsupported; on Apple
+Silicon, use native ARM64 Emacs. The client rejects Intel macOS before downloading or running
+a service, including when an explicit executable path is configured.
 These are distinct native build baselines; compatibility with older systems is not promised.
-Linux ARM64 is available only when a four-platform CI release has completed; the older =v0.2.0=
+Linux ARM64 needs a completed three-platform CI release; the older =v0.2.0=
 release has no ARM64 Linux asset or pin. Other systems are not yet supported. Use the *whole* extracted archive: the executable,
 =lib/= and =licenses/= must stay together. Projects distributing LispM Auth can put its contents
 in =prebuilt/PLATFORM/= next to =lispm-auth.el=, or set =lispm-auth-service-program= to an absolute
@@ -36,9 +39,11 @@ package or opening a store never downloads anything. With a local release archiv
 (lispm-auth-install-service "/path/to/lispm-auth-service-v0.2.0-darwin-arm64.tar.gz")
 #+end_src
 
-*Publication status:* service =v0.2.0= is published with verified archives for all three supported
-platforms. Client =0.2.1= pins the actual published archive hashes, independently checked against the tested CI
-artifacts. Run =M-x lispm-auth-install-service= for the explicit, confirmed download. The tagged
+*Publication status:* the existing service =v0.2.0= release predates this support policy: it has
+verified macOS ARM64, legacy macOS Intel and Linux x86_64 archives, but no Linux ARM64 archive.
+This source client retains only the verified macOS ARM64 and Linux x86_64 pins from that release;
+no Linux ARM64 pin is fabricated. A new three-platform release is not yet claimed here.
+The retained published archive hashes were independently checked against the tested CI artifacts. Run =M-x lispm-auth-install-service= for the explicit, confirmed download. The tagged
 =v0.2.0= client predates these pins; use this updated client or configure a verified prebuilt archive.
 The release also provides project and dependency source archives, vendor patches and rebuild/relink
 instructions. The installer never trusts a checksum fetched alongside the executable as its sole
@@ -198,7 +203,7 @@ script invoking ECL/SBCL. libsodium supplies Argon2id (64 MiB, three passes) and
 
 *All future formal releases are published automatically by the CI release workflow*, never by
 manually building, uploading or promoting assets from a workstation. A =vMAJOR.MINOR.PATCH= tag
-whose commit is on =main= triggers four native builds, crypto/ERT/byte-compilation tests,
+whose commit is on =main= triggers three native builds, crypto/ERT/byte-compilation tests,
 recursive runtime closure audits and restricted-PATH relocation tests. Linux sodium paths use
 the runner's actual multiarch tuple, not an x86_64 assumption.
 
@@ -208,21 +213,23 @@ package revisions and authenticated =.dsc=/original/Debian source archives. Unsu
 metadata fails the release rather than silently omitting sources. Each platform source asset
 includes =SOURCE-PROVENANCE.json= and =BUILD-AND-RELINK.txt=.
 
-Assembly requires all four platform artifacts from the same workflow run. It generates
+Assembly requires all three platform artifacts from the same workflow run. It generates
 =lispm-auth-client-X.Y.Z.tar.gz= with package Version =X.Y.Z=, fixed service version =vX.Y.Z= and
-all four SHA256 pins derived from the actual archives. *Consumers must use this generated client
+all three SHA256 pins derived from the actual archives. *Consumers must use this generated client
 asset*, not GitHub's automatic tag source download: the bare tag is build input and retains the
 previous pins. The unmodified project source is also published separately, alongside dependency
 sources, licenses, =RELEASE-MANIFEST.json= and =SHA256SUMS=.
 
-A second four-platform native matrix installs each actual service archive with the generated
+A second three-platform native matrix installs each actual service archive with the generated
 client's production pins (without replacing them in the test), probes crypto and rejects an
 overwrite. Only after every gate succeeds does the tag-only, write-permitted job create a public
 release automatically. Pull requests and branch/manual runs exercise the same assembly and
 validation without publishing. Existing public or draft versions are never overwritten. Existing
-=v0.2.0= and =client-v0.2.1= releases remain unchanged.
+=v0.2.0= and =client-v0.2.1= releases remain unchanged. The obsolete fixed-=v0.2.3=
+Rosetta recovery workflow is removed. Existing tags are not moved; releasing this support-policy
+change requires a new version tag on the updated =main= commit.
 
-Adding this workflow is not evidence of a successful four-platform release. A restricted-PATH
+Adding this workflow is not evidence of a successful three-platform release. A restricted-PATH
 test plus loader closure audit does not replace testing on fresh supported machines.
 Linux glibc/loader and Apple system libraries remain OS dependencies; the artifacts are neither
 universal binaries nor musl/Windows distributions.

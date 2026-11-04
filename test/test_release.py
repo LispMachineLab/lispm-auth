@@ -3,6 +3,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import re
 from pathlib import Path
 import subprocess
 import tarfile
@@ -86,12 +87,48 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.assemble()
 
-    def test_missing_platform_fails(self):
-        import shutil
-        shutil.rmtree(self.inputs / "service-linux-arm64")
-        with self.assertRaises(ValueError):
+    def test_official_platform_sets_and_workflow_agree(self):
+        packaging = load("package-service")
+        expected = {"darwin-arm64", "linux-x86_64", "linux-arm64"}
+        self.assertEqual(set(assembly.PLATFORMS), expected)
+        self.assertEqual(set(packaging.PLATFORMS), expected)
+        workflow = (ROOT / ".github/workflows/service.yml").read_text()
+        platforms = re.findall(r"^\s+platform: (\S+)$", workflow, re.M)
+        self.assertEqual(len(platforms), 6)
+        self.assertEqual(set(platforms), expected)
+        self.assertNotIn("macos-15-intel", workflow)
+        self.assertFalse((ROOT / ".github/workflows/recover-v023.yml").exists())
+        self.assertFalse((ROOT / "scripts/setup-rosetta.sh").exists())
+
+    def test_extra_intel_platform_fails(self):
+        (self.inputs / "service-darwin-x86_64").mkdir()
+        with self.assertRaisesRegex(ValueError, "Exactly three platform artifacts"):
             self.assemble()
         self.assertFalse(self.output.exists())
+
+    def test_intel_pin_fails_assembly_and_verification(self):
+        pins = {p: "a" * 64 for p in assembly.PLATFORMS}
+        pins["darwin-x86_64"] = "b" * 64
+        with self.assertRaisesRegex(ValueError, "Exactly three verified service pins"):
+            assembly.stamp_client((ROOT / "lispm-auth.el").read_text(), self.version, pins)
+        self.assemble()
+        manifest_path = self.output / "RELEASE-MANIFEST.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["service_sha256"]["darwin-x86_64"] = "b" * 64
+        manifest_path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "Incomplete platform set"):
+            verification.verify(self.output)
+
+    def test_missing_platform_fails(self):
+        import shutil
+        for platform in assembly.PLATFORMS:
+            directory = self.inputs / ("service-" + platform)
+            saved = self.root / directory.name
+            shutil.move(directory, saved)
+            with self.subTest(platform=platform), self.assertRaises(ValueError):
+                self.assemble()
+            self.assertFalse(self.output.exists())
+            shutil.move(saved, directory)
 
     def test_wrong_checksum_fails(self):
         (self.inputs / "service-linux-arm64" / "SHA256SUMS").write_text("wrong")
