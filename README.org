@@ -15,9 +15,11 @@ secrets, so that only their starts ask for the password.  In code, the prefix is
 
 * Installing the service
 
-The release targets are =darwin-arm64=, =darwin-x86_64= and =linux-x86_64= (glibc, Ubuntu 22.04
-or newer). macOS CI builds use macOS 14 (ARM64) and macOS 15 (Intel); compatibility with older
-macOS releases is not promised. Other systems are not yet supported. Use the *whole* extracted archive: the executable,
+The CI release targets are =darwin-arm64= (macOS 14), =darwin-x86_64= (macOS 15),
+=linux-x86_64= (glibc, Ubuntu 22.04) and =linux-arm64= (glibc, Ubuntu 24.04).
+These are distinct native build baselines; compatibility with older systems is not promised.
+Linux ARM64 is available only when a four-platform CI release has completed; the older =v0.2.0=
+release has no ARM64 Linux asset or pin. Other systems are not yet supported. Use the *whole* extracted archive: the executable,
 =lib/= and =licenses/= must stay together. Projects distributing LispM Auth can put its contents
 in =prebuilt/PLATFORM/= next to =lispm-auth.el=, or set =lispm-auth-service-program= to an absolute
 local executable filename. The resolver never searches PATH or launches a Lisp interpreter.
@@ -194,18 +196,42 @@ The service reads one tab-separated hex request from stdin per process; no passw
 passed in argv, environment or temporary plaintext files. This is a compiled executable, not a
 script invoking ECL/SBCL. libsodium supplies Argon2id (64 MiB, three passes) and XChaCha20-Poly1305.
 
-The service workflow builds on macOS arm64/x86_64 and Linux x86_64, bundles recursive non-system
-runtime dependencies, audits loader references, tests extracted archives with a restricted PATH,
-and uploads archives and SHA256SUMS. A tag-triggered release is a *draft* for review, not an
-unattended publication. CI has not been run merely by adding the workflow. A restricted-PATH test
-plus loader closure audit is useful but does not replace testing on fresh supported machines.
+*All future formal releases are published automatically by the CI release workflow*, never by
+manually building, uploading or promoting assets from a workstation. A =vMAJOR.MINOR.PATCH= tag
+whose commit is on =main= triggers four native builds, crypto/ERT/byte-compilation tests,
+recursive runtime closure audits and restricted-PATH relocation tests. Linux sodium paths use
+the runner's actual multiarch tuple, not an x86_64 assumption.
+
+Each build collects exact corresponding dependency sources: installed Homebrew formulae,
+receipts, upstream archives and patches with verified hashes, or Ubuntu's exact installed source
+package revisions and authenticated =.dsc=/original/Debian source archives. Unsupported vendor
+metadata fails the release rather than silently omitting sources. Each platform source asset
+includes =SOURCE-PROVENANCE.json= and =BUILD-AND-RELINK.txt=.
+
+Assembly requires all four platform artifacts from the same workflow run. It generates
+=lispm-auth-client-X.Y.Z.tar.gz= with package Version =X.Y.Z=, fixed service version =vX.Y.Z= and
+all four SHA256 pins derived from the actual archives. *Consumers must use this generated client
+asset*, not GitHub's automatic tag source download: the bare tag is build input and retains the
+previous pins. The unmodified project source is also published separately, alongside dependency
+sources, licenses, =RELEASE-MANIFEST.json= and =SHA256SUMS=.
+
+A second four-platform native matrix installs each actual service archive with the generated
+client's production pins (without replacing them in the test), probes crypto and rejects an
+overwrite. Only after every gate succeeds does the tag-only, write-permitted job create a public
+release automatically. Pull requests and branch/manual runs exercise the same assembly and
+validation without publishing. Existing public or draft versions are never overwritten. Existing
+=v0.2.0= and =client-v0.2.1= releases remain unchanged.
+
+Adding this workflow is not evidence of a successful four-platform release. A restricted-PATH
+test plus loader closure audit does not replace testing on fresh supported machines.
 Linux glibc/loader and Apple system libraries remain OS dependencies; the artifacts are neither
 universal binaries nor musl/Windows distributions.
 
 Build inputs/toolchains from runner images and package repositories may change. Artifacts record
 runtime dependency origins and notices; builds are not claimed to be bit-for-bit reproducible.
-Release maintainers must review the actual workflow results, dependencies, OS baselines, full
-corresponding source availability and hashes before publishing/pinning a release. Generated
+Release maintainers review changes and authorize the version tag; CI alone builds, pins,
+validates and publishes the resulting release. Inspect actual workflow results, dependency
+provenance and OS baselines rather than treating a tag or workflow definition as release proof. Generated
 =build/=, =dist/= and =prebuilt/= trees stay untracked; historical binaries are not removed by
 rewriting git history.
 

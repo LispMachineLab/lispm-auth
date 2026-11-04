@@ -8,6 +8,7 @@
        (prefix (pathname (concatenate 'string sodium-prefix "/")))
        (library (or (probe-file (merge-pathnames "lib/libsodium.a" prefix))
                     (probe-file (merge-pathnames "lib/x86_64-linux-gnu/libsodium.a" prefix))
+                    (probe-file (merge-pathnames "lib/aarch64-linux-gnu/libsodium.a" prefix))
                     (error "Static libsodium is required under ~a" prefix)))
        (include (merge-pathnames "include/" prefix)))
   (let ((c::*cc-flags* (format nil "~a -I~a" c::*cc-flags* include)))

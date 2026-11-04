@@ -207,13 +207,55 @@ An explicitly supplied but invalid executable is an error, not a skip."
             (should (equal (lispm-auth--service-program) file))))
       (delete-directory lispm-auth--package-directory t))))
 
+(ert-deftest lispm-auth-test-service-platforms ()
+  "Recognize ARM64 aliases without treating other architectures as supported."
+  (dolist (case '((darwin "aarch64-apple-darwin" "darwin-arm64")
+                  (darwin "arm64-apple-darwin" "darwin-arm64")
+                  (darwin "x86_64-apple-darwin" "darwin-x86_64")
+                  (gnu/linux "aarch64-unknown-linux-gnu" "linux-arm64")
+                  (gnu/linux "arm64-unknown-linux-gnu" "linux-arm64")
+                  (gnu/linux "x86_64-pc-linux-gnu" "linux-x86_64")
+                  (gnu/linux "armv7l-unknown-linux-gnueabihf" nil)
+                  (gnu/linux "riscv64-unknown-linux-gnu" nil)))
+    (let ((system-type (nth 0 case))
+          (system-configuration (nth 1 case)))
+      (should (equal (lispm-auth--service-platform) (nth 2 case))))))
+
+(ert-deftest lispm-auth-test-linux-arm64-package-artifact ()
+  "ARM64 Linux resolves local prebuilt artifacts without needing a release pin."
+  (let ((system-type 'gnu/linux)
+        (system-configuration "aarch64-unknown-linux-gnu")
+        (lispm-auth-service-program nil)
+        (lispm-auth--package-directory
+         (file-name-as-directory (make-temp-file "lispm-auth-arm64-" t))))
+    (unwind-protect
+        (let ((file (expand-file-name "prebuilt/linux-arm64/lispm-auth-service"
+                                      lispm-auth--package-directory)))
+          (make-directory (file-name-directory file) t)
+          (with-temp-file file (insert "#!/bin/sh\nexit 0\n"))
+          (set-file-modes file #o700)
+          (should (equal (lispm-auth--service-program) file)))
+      (delete-directory lispm-auth--package-directory t))))
+
+(ert-deftest lispm-auth-test-linux-arm64-install-needs-verified-pin ()
+  "Recognition must not enable downloads with a fabricated release pin."
+  (let ((system-type 'gnu/linux)
+        (system-configuration "aarch64-unknown-linux-gnu")
+        (lispm-auth-service-sha256 nil))
+    (should-not (assoc "linux-arm64" lispm-auth-service-sha256))
+    (cl-letf (((symbol-function 'lispm-auth--download-service)
+               (lambda (&rest _) (ert-fail "Unexpected download")))
+              ((symbol-function 'lispm-auth--extract-service)
+               (lambda (&rest _) (ert-fail "Unexpected extraction"))))
+      (should-error (lispm-auth-install-service) :type 'user-error))))
+
 (ert-deftest lispm-auth-test-service-resolver-unsupported-platform ()
   (let ((lispm-auth-service-program nil)
         (system-type 'windows-nt))
     (should-not (lispm-auth--service-platform))
     (should-error (lispm-auth--service-program) :type 'lispm-auth-unavailable))
   (let ((system-type 'gnu/linux)
-        (system-configuration "aarch64-unknown-linux-gnu"))
+        (system-configuration "riscv64-unknown-linux-gnu"))
     (should-not (lispm-auth--service-platform))))
 
 (ert-deftest lispm-auth-test-legacy-store-rejected-without-overwriting ()

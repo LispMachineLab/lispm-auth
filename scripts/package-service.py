@@ -30,6 +30,7 @@ SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+)+(?:[-A-Za-z0-9.]*)$")
 # Deliberately small baseline: other libraries need explicit license coverage.
 GLIBC = re.compile(r"^(?:lib(?:c|m|pthread|dl|rt|resolv|util|anl)\.so\.[0-9]+|ld-linux[^/]*\.so\.[0-9]+)$")
+PLATFORMS = ("darwin-arm64", "darwin-x86_64", "linux-arm64", "linux-x86_64")
 
 
 class PackagingError(RuntimeError):
@@ -39,10 +40,39 @@ class PackagingError(RuntimeError):
 def run(*args: object) -> str:
     try:
         return subprocess.run([str(a) for a in args], check=True, text=True,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.strip()
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=dict(os.environ, LC_ALL="C")).stdout.strip()
     except (OSError, subprocess.CalledProcessError) as exc:
         detail = getattr(exc, "stderr", "") or str(exc)
         raise PackagingError(f"Command failed: {' '.join(map(str, args))}\n{detail}") from exc
+
+
+def binary_platform(path: Path, host_os: str) -> str:
+    """Identify one supported 64-bit architecture, never defaulting to x86_64."""
+    if host_os == "darwin":
+        architectures = run("lipo", "-archs", path).split()
+        if len(architectures) == 1 and architectures[0] in {"arm64", "x86_64"}:
+            return "darwin-" + architectures[0]
+        raise PackagingError(f"Unsupported/ambiguous Mach-O architecture in {path}: {architectures}")
+    if host_os == "linux":
+        header = run("readelf", "-h", path)
+        fields = {}
+        for key in ("Class", "Data", "Machine"):
+            values = re.findall(rf"^\s*{key}:\s*(.*?)\s*$", header, re.MULTILINE)
+            if len(values) != 1:
+                raise PackagingError(f"Missing/ambiguous ELF {key} in {path}")
+            fields[key] = values[0]
+        architecture = {"AArch64": "arm64", "Advanced Micro Devices X86-64": "x86_64"}.get(fields["Machine"])
+        if fields["Class"] == "ELF64" and fields["Data"] == "2's complement, little endian" and architecture:
+            return "linux-" + architecture
+        raise PackagingError(f"Unsupported ELF architecture in {path}: {fields}")
+    raise PackagingError(f"Unsupported packaging host: {host_os}")
+
+
+def check_platform(path: Path, expected: str) -> None:
+    actual = binary_platform(path, expected.split("-", 1)[0])
+    if actual != expected:
+        raise PackagingError(f"Binary architecture mismatch in {path}: expected {expected}, got {actual}")
 
 
 def dependency_name(path: str) -> str:
@@ -98,7 +128,7 @@ class MacBundler:
         self.copied: dict[Path, Path] = {}
         self.names: dict[str, Path] = {}
         self.origins: list[Path] = []
-        self.architectures = run("lipo", "-archs", self.binary).split()
+        self.platform = binary_platform(self.binary, "darwin")
 
     def resolve(self, ref: str, owner: Path, rpaths: list[Path]) -> Path:
         if ref.startswith("@loader_path/"):
@@ -126,8 +156,7 @@ class MacBundler:
         raise PackagingError(f"Unresolved/unsupported rpath {ref!r} in {owner}")
 
     def visit(self, source: Path, dest: Path, inherited: list[Path]) -> None:
-        if not set(self.architectures).issubset(run("lipo", "-archs", source).split()):
-            raise PackagingError(f"Dependency architecture mismatch: {source}")
+        check_platform(source, self.platform)
         self.copied[source] = dest  # mark before recursion (cycles are valid)
         shutil.copyfile(source, dest)
         dest.chmod(0o755)
@@ -167,6 +196,7 @@ class MacBundler:
 
     def audit(self) -> None:
         for path in self.copied.values():
+            check_platform(path, self.platform)
             deps, rpaths, identity = mac_info(path)
             if rpaths:
                 raise PackagingError(f"Residual rpaths in {path}: {rpaths}")
@@ -190,6 +220,7 @@ class LinuxBundler:
         self.names: dict[str, Path] = {}
         self.origins: list[Path] = []
         self.cache: dict[str, list[Path]] = {}
+        self.platform = binary_platform(self.binary, "linux")
         for line in run("ldconfig", "-p").splitlines():
             match = re.match(r"\s*(\S+) .* => (\S+)", line)
             if match:
@@ -215,8 +246,12 @@ class LinuxBundler:
             candidates.extend(self.cache.get(ref, []))
         for path in candidates:
             if path.is_file():
-                # ldconfig may contain both 32- and 64-bit entries.
-                if run("readelf", "-h", path).split("Machine:")[-1].splitlines()[0].strip() == run("readelf", "-h", self.binary).split("Machine:")[-1].splitlines()[0].strip():
+                # ldconfig may contain multiple architectures and ELF classes.
+                try:
+                    platform = binary_platform(path, "linux")
+                except PackagingError:
+                    continue
+                if platform == self.platform:
                     return path.resolve()
         raise PackagingError(f"Unresolved ELF dependency {ref!r} in {owner}")
 
@@ -232,6 +267,7 @@ class LinuxBundler:
         return ref.startswith(("/lib/", "/lib64/", "/usr/lib/", "/usr/lib64/")) and ".." not in Path(ref).parts
 
     def visit(self, source: Path, dest: Path) -> None:
+        check_platform(source, self.platform)
         self.copied[source] = dest
         shutil.copyfile(source, dest)
         dest.chmod(0o755)
@@ -262,12 +298,14 @@ class LinuxBundler:
         interpreter = run("patchelf", "--print-interpreter", self.binary)
         if not self.system(interpreter) or not Path(interpreter).is_file():
             raise PackagingError(f"Unsupported ELF interpreter: {interpreter}")
+        check_platform(Path(interpreter), self.platform)
         self.visit(self.binary, self.root / NAME)
         self.audit()
         return self.origins
 
     def audit(self) -> None:
         for path in self.copied.values():
+            check_platform(path, self.platform)
             deps, rpaths = self.info(path)
             expected = "$ORIGIN/lib" if path.parent == self.root else "$ORIGIN"
             if rpaths != [expected]:
@@ -425,13 +463,18 @@ def create_archive(root: Path, destination: Path) -> None:
             raise PackagingError("Archive contains a non-regular member")
 
 
-def audit_directory(root: Path) -> None:
+def audit_directory(root: Path, platform: str | None = None) -> None:
     root = root.resolve()
     if not (root / NAME).is_file():
         raise PackagingError(f"Missing service in {root}")
     for path in root.rglob("*"):
         if path.is_symlink() or not (path.is_file() or path.is_dir()):
             raise PackagingError(f"Non-regular artifact member: {path}")
+    if platform is not None:
+        host_os = "darwin" if sys.platform == "darwin" else "linux" if sys.platform.startswith("linux") else "unsupported"
+        if platform not in PLATFORMS or not platform.startswith(host_os + "-"):
+            raise PackagingError(f"Unsupported target/host combination: {platform} / {host_os}")
+        check_platform(root / NAME, platform)
     klass = MacBundler if sys.platform == "darwin" else LinuxBundler
     bundler = klass(root / NAME, root)
     binaries = [root / NAME] + list((root / "lib").iterdir())
@@ -440,6 +483,7 @@ def audit_directory(root: Path) -> None:
         interpreter = run("patchelf", "--print-interpreter", root / NAME)
         if not bundler.system(interpreter) or not Path(interpreter).is_file():
             raise PackagingError(f"Unsupported ELF interpreter: {interpreter}")
+        check_platform(Path(interpreter), bundler.platform)
     bundler.audit()
 
 
@@ -449,13 +493,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--output", "--output-dir", dest="output_dir", type=Path)
     parser.add_argument("--version")
-    parser.add_argument("--platform", choices=("darwin-arm64", "darwin-x86_64", "linux-x86_64"))
+    parser.add_argument("--platform", choices=PLATFORMS)
     parser.add_argument("--dependency-root", action="append", default=[], metavar="NAME=PREFIX")
     parser.add_argument("--dependency-version", action="append", default=[], metavar="NAME=VERSION")
     args = parser.parse_args(argv)
     try:
         if args.audit:
-            audit_directory(args.audit)
+            audit_directory(args.audit, args.platform)
             print(f"Runtime closure verified: {args.audit}")
             return 0
         if not (args.binary and args.output_dir and args.version):
@@ -465,15 +509,14 @@ def main(argv: list[str] | None = None) -> int:
         host_os = "darwin" if sys.platform == "darwin" else "linux" if sys.platform.startswith("linux") else "unsupported"
         if not args.binary.is_file():
             raise PackagingError(f"Missing service binary: {args.binary}")
-        filetype = run("file", "-b", args.binary)
+        actual_platform = binary_platform(args.binary, host_os)
         if args.platform is None:
-            args.platform = host_os + ("-arm64" if "arm64" in filetype or "aarch64" in filetype else "-x86_64")
-        target_os, target_arch = args.platform.split("-", 1)
-        if target_os != host_os or args.platform not in {"darwin-arm64", "darwin-x86_64", "linux-x86_64"}:
+            args.platform = actual_platform
+        target_os, _ = args.platform.split("-", 1)
+        if target_os != host_os or args.platform not in PLATFORMS:
             raise PackagingError(f"Unsupported target/host combination: {args.platform} / {host_os}")
-        expected = "arm64" if host_os == "darwin" and target_arch == "arm64" else "aarch64" if target_arch == "arm64" else "x86-64" if host_os == "linux" else "x86_64"
-        if expected not in filetype or ("Mach-O" if host_os == "darwin" else "ELF") not in filetype:
-            raise PackagingError(f"Binary is not target {args.platform}: {filetype}")
+        if args.platform != actual_platform:
+            raise PackagingError(f"Binary architecture mismatch: expected {args.platform}, got {actual_platform}")
         registry = json.loads(REGISTRY.read_text())
         roots = assignments(args.dependency_root, registry)
         versions = assignments(args.dependency_version, registry)

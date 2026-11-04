@@ -1123,7 +1123,7 @@ This is separate from the encrypted store.  Loading LispM Auth never downloads."
                     ((string-match-p "\\`x86_64" system-configuration)
                      "x86_64"))))
     (let ((platform (and os arch (concat os "-" arch))))
-      (and (member platform '("darwin-arm64" "darwin-x86_64" "linux-x86_64"))
+      (and (member platform '("darwin-arm64" "darwin-x86_64" "linux-arm64" "linux-x86_64"))
            platform))))
 
 (defun lispm-auth--service-program ()

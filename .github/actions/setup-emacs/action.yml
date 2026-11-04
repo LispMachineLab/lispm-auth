@@ -1,0 +1,38 @@
+name: Build supported headless Emacs
+description: Cache GNU Emacs 30.1 with zlib on the native runner
+runs:
+  using: composite
+  steps:
+    - name: Install Emacs build dependencies
+      shell: bash
+      run: |
+        if [[ "$RUNNER_OS" == macOS ]]; then
+          brew install texinfo
+          echo "$(brew --prefix texinfo)/bin" >> "$GITHUB_PATH"
+        else
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses-dev zlib1g-dev libgnutls28-dev texinfo
+        fi
+    - uses: actions/cache@v4
+      id: cache
+      with:
+        path: ${{ runner.temp }}/emacs
+        key: emacs-30.1-zlib-${{ runner.os }}-${{ runner.arch }}-v1
+    - name: Build GNU Emacs
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        curl --fail --location --retry 3 https://ftp.gnu.org/gnu/emacs/emacs-30.1.tar.xz -o "$RUNNER_TEMP/emacs.tar.xz"
+        tar -xf "$RUNNER_TEMP/emacs.tar.xz" -C "$RUNNER_TEMP"
+        cd "$RUNNER_TEMP/emacs-30.1"
+        ./configure --prefix="$RUNNER_TEMP/emacs" --without-x --without-ns \
+          --without-native-compilation --without-tree-sitter --without-dbus \
+          --without-sound --without-pop --without-mailutils --without-compress-install
+        make -j3
+        make install
+    - name: Require zlib support
+      shell: bash
+      run: |
+        "$RUNNER_TEMP/emacs/bin/emacs" -Q --batch \
+          --eval '(unless (fboundp (quote zlib-decompress-region)) (error "CI Emacs needs zlib"))'
+        echo "$RUNNER_TEMP/emacs/bin" >> "$GITHUB_PATH"
