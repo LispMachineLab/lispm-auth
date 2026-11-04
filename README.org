@@ -34,8 +34,8 @@ package or opening a store never downloads anything. With a local release archiv
 (lispm-auth-install-service "/path/to/lispm-auth-service-v0.2.0-darwin-arm64.tar.gz")
 #+end_src
 
-*Publication status:* =v0.2.0= is published with verified archives for all three supported platforms.
-This client pins the actual published archive hashes, independently checked against the tested CI
+*Publication status:* service =v0.2.0= is published with verified archives for all three supported
+platforms. Client =0.2.1= pins the actual published archive hashes, independently checked against the tested CI
 artifacts. Run =M-x lispm-auth-install-service= for the explicit, confirmed download. The tagged
 =v0.2.0= client predates these pins; use this updated client or configure a verified prebuilt archive.
 The release also provides project and dependency source archives, vendor patches and rebuild/relink
