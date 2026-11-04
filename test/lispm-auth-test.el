@@ -1655,5 +1655,44 @@ gone, so that nothing drifts across the page behind it."
               ((symbol-function 'lispm-auth-store-exists-p) #'ignore))
       (should-error (lispm-auth-change-password) :type 'user-error))))
 
+(ert-deftest lispm-auth-test-page-read-suppresses-keystroke-echo ()
+  (let ((events '(?s ?e ?c ?r ?e ?t return))
+        (cleared 0)
+        (echo-seen nil)
+        (lispm-auth--page-show-function #'ignore)
+        (lispm-auth--page-hide-function #'ignore))
+    (cl-letf (((symbol-function 'lispm-auth-store-exists-p) #'ignore)
+              ((symbol-function 'clear-this-command-keys)
+               (lambda (&rest _) (setq cleared (1+ cleared))))
+              (lispm-auth--page-event-function
+               (lambda ()
+                 (push echo-keystrokes echo-seen)
+                 (pop events))))
+      (should (equal "secret" (lispm-auth--page-read "LispM password: " nil nil)))
+      (should (cl-every #'zerop echo-seen))
+      (should (>= cleared 7)))))
+
+(ert-deftest lispm-auth-test-page-logo-file-skips-missing-candidates ()
+  (let ((temp (make-temp-file "lispm-lambda-" nil ".png")))
+    (unwind-protect
+        (let ((lispm-auth-page-logo "/nonexistent/lispm-lambda.png")
+              (lispm-auth--package-directory "/nonexistent/pkg/"))
+          (cl-letf (((symbol-function 'locate-library) (lambda (&rest _) nil))
+                    ((symbol-function 'lispm-ui-icon-file)
+                     (lambda (icon) (and (eq icon 'lambda) temp))))
+            (should (equal temp (lispm-auth--page-logo-file)))))
+      (ignore-errors (delete-file temp)))))
+
+(ert-deftest lispm-auth-test-page-translates-via-hook ()
+  (let ((lispm-auth-translate-function
+         (lambda (msg &rest args)
+           (concat "TR:" (apply #'format msg args)))))
+    (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) nil)))
+      (let ((lines (lispm-auth--page-lines '(:stage single :change t))))
+        (should (cl-some (lambda (l) (string-search "TR:Encrypted Secrets" l)) lines))
+        (should (cl-some (lambda (l) (string-search "TR:Return opens the store." l)) lines))
+        (should (cl-some (lambda (l) (string-search "TR:Return confirms" l)) lines))
+        (should (cl-some (lambda (l) (string-search "TR:C-p changes the password" l)) lines))))))
+
 (provide 'lispm-auth-test)
 ;;; lispm-auth-test.el ends here
