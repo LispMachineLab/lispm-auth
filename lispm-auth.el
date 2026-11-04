@@ -4,7 +4,7 @@
 
 ;; Author: Ryan.K
 ;; URL: https://github.com/LispMachineLab/lispm-auth
-;; Version: 0.2.1
+;; Version: 0.2.4
 ;; Package-Requires: ((emacs "30.1"))
 ;; Keywords: tools, data
 ;; SPDX-License-Identifier: AGPL-3.0-or-later
@@ -553,6 +553,17 @@ window of LispM's own rather than across it.  The pages that set a
 password are windows whether or not this is set; LispM's own start at the
 password a store already has fills the window, the lock screen it is.")
 
+(defvar lispm-auth-translate-function nil
+  "Function translating user-facing messages on the password page, or nil.
+Called with a message format string and optional `format' arguments, as
+`lispm-desktop-tr' is.")
+
+(defun lispm-auth--tr (message &rest args)
+  "Translate MESSAGE with ARGS using `lispm-auth-translate-function'."
+  (if lispm-auth-translate-function
+      (apply lispm-auth-translate-function message args)
+    (apply #'format message args)))
+
 
 (define-derived-mode lispm-auth-page-mode special-mode "LispM Password"
   "Major mode of the page asking for LispM's password.
@@ -564,6 +575,11 @@ The page reads keys as events, see `lispm-auth--page-read'."
               ;; would take the window's whole body from the page's image.
               header-line-format nil
               tab-line-format nil
+              left-fringe-width 0
+              right-fringe-width 0
+              left-margin-width 0
+              right-margin-width 0
+              fringe-indicator-alist nil
               auto-hscroll-mode nil
               hscroll-margin 0
               cursor-type nil
@@ -584,23 +600,33 @@ The page reads keys as events, see `lispm-auth--page-read'."
 A page asking for a new password says so; one asking for the password
 the store has names LispM, or the application it is opening."
   (pcase (plist-get page :stage)
-    ((or 'new 'again) "Set a Password")
+    ((or 'new 'again) (lispm-auth--tr "Set a Password"))
     (_ (lispm-auth--page-app-name))))
 
 (defun lispm-auth--page-bullet ()
   "Return the character a typed password shows as."
   (if (and (display-graphic-p) (char-displayable-p ?•)) "•" "*"))
 
+(defconst lispm-auth--package-directory
+  (file-name-directory (or load-file-name buffer-file-name))
+  "Directory holding LispM Auth and its Common Lisp service.")
+
 (defun lispm-auth--page-logo-file ()
   "Return the file of the password page's logo, or nil when there is none."
-  (let ((file (or lispm-auth-page-logo
-                  (when-let* ((library (locate-library "lispm-auth")))
-                    (expand-file-name "images/lispm-lambda.png"
-                                      (file-name-directory library)))
-                  (when load-file-name
-                    (expand-file-name "images/lispm-lambda.png"
-                                      (file-name-directory load-file-name))))))
-    (and file (file-readable-p file) file)))
+  (seq-find
+   (lambda (file) (and (stringp file) (file-readable-p file)))
+   (list lispm-auth-page-logo
+         (when lispm-auth--package-directory
+           (expand-file-name "images/lispm-lambda.png"
+                             lispm-auth--package-directory))
+         (when-let* ((library (locate-library "lispm-auth")))
+           (expand-file-name "images/lispm-lambda.png"
+                             (file-name-directory library)))
+         (when load-file-name
+           (expand-file-name "images/lispm-lambda.png"
+                             (file-name-directory load-file-name)))
+         (when (fboundp 'lispm-ui-icon-file)
+           (ignore-errors (lispm-ui-icon-file 'lambda))))))
 
 (defvar lispm-auth--page-logo-image nil
   "The logo image object the password page shows, once made.")
@@ -639,10 +665,10 @@ underscores, which every terminal shows."
 (defun lispm-auth--page-placeholder (page)
   "Return the word PAGE's empty field shows, before a key is typed."
   (pcase (plist-get page :stage)
-    ('current "Current password")
-    ('new "New password")
-    ('again "Enter it again")
-    (_ "LispM password")))
+    ('current (lispm-auth--tr "Current password"))
+    ('new (lispm-auth--tr "New password"))
+    ('again (lispm-auth--tr "Enter it again"))
+    (_ (lispm-auth--tr "LispM password"))))
 
 (defun lispm-auth--page-field-image (page)
   "Return PAGE's field as an image: a white box with what is typed in it.
@@ -701,16 +727,16 @@ along that way it is, from 0 to 1."
   (let* ((window-width (lispm-auth--page-text-width page))
          (logo (lispm-auth--page-logo-image))
          (field (lispm-auth--page-field-image page))
-         (divider (lispm-auth--page-divider-image))
+         (divider (and logo (lispm-auth--page-divider-image)))
          (gap 24)
          (logo-width (if logo lispm-auth-page-logo-size 0))
-         (divider-width 2)
+         (divider-width (if logo 2 0))
          (field-width lispm-auth-page-field-pixels)
-         (total (+ (if logo (+ logo-width gap) 0)
-                   divider-width gap field-width))
+         (total (+ (if logo (+ logo-width gap divider-width gap) 0)
+                   field-width))
          (left (max 0 (round (- window-width total) 2)))
          (divider-x (+ left logo-width (if logo gap 0)))
-         (field-x (+ divider-x divider-width gap))
+         (field-x (if logo (+ divider-x divider-width gap) left))
          (slide (plist-get page :slide))
          (field-centre (+ field-x (/ field-width 2)))
          (logo-x (if (and slide logo)
@@ -727,8 +753,9 @@ along that way it is, from 0 to 1."
       ;; place: an absolute position cannot be given to them behind a logo
       ;; that has passed it, and they would drift across the page.
       (unless slide
-        (concat (lispm-auth--page-stretch-to divider-x)
-                (propertize " " 'display divider)
+        (concat (when divider
+                  (concat (lispm-auth--page-stretch-to divider-x)
+                          (propertize " " 'display divider)))
                 (lispm-auth--page-stretch-to field-x)
                 (propertize " " 'display field
                             'lispm-auth-page-field-image field))))
@@ -736,28 +763,35 @@ along that way it is, from 0 to 1."
 
 (defun lispm-auth--page-prompt (page)
   "Return the prompt PAGE asks its password with, without trailing blanks."
-  (string-trim-right
-   (if (eq (plist-get page :stage) 'again)
-       "Enter the new password again:"
-     (or (plist-get page :prompt) "LispM password:"))))
+  (let ((prompt (string-trim-right
+                 (if (eq (plist-get page :stage) 'again)
+                     "Enter the new password again:"
+                   (or (plist-get page :prompt) "LispM password:")))))
+    (if (member prompt '("Enter the new password again:"
+                         "LispM password:"
+                         "New LispM password:"))
+        (lispm-auth--tr prompt)
+      prompt)))
 
 (defun lispm-auth--page-answer (page)
   "Return the line under PAGE's field: its message, or what Return does."
   (if-let* ((message (plist-get page :message)))
       (propertize message 'face 'lispm-auth-page-error)
     (propertize (pcase (plist-get page :stage)
-                  ('new (format "Choose a password for %s's secrets.  It is asked for at each start."
-                                (lispm-auth--page-app-name)))
-                  ('again "It is asked for at each start.")
-                  ('current "Return verifies the current password.")
-                  (_ "Return opens the store."))
+                  ('new (lispm-auth--tr "Choose a password for %s's secrets.  It is asked for at each start."
+                                        (lispm-auth--page-app-name)))
+                  ('again (lispm-auth--tr "It is asked for at each start."))
+                  ('current (lispm-auth--tr "Return verifies the current password."))
+                  (_ (lispm-auth--tr "Return opens the store.")))
                 'face 'lispm-auth-page-hint)))
 
 (defun lispm-auth--page-footer (page)
   "Return the line of keys PAGE answers to, at its foot."
-  (concat "Return confirms        Esc cancels"
+  (concat (lispm-auth--tr "Return confirms")
+          "        "
+          (lispm-auth--tr "Esc cancels")
           (when (plist-get page :change)
-            "        C-p changes the password")))
+            (concat "        " (lispm-auth--tr "C-p changes the password")))))
 
 
 (defun lispm-auth--page-lines (page)
@@ -772,7 +806,8 @@ one."
          (footer (lispm-auth--page-footer page)))
     (if (display-graphic-p)
         (list (propertize title 'face 'lispm-auth-page-title)
-              (propertize "Encrypted Secrets" 'face 'lispm-auth-page-tagline)
+              (propertize (lispm-auth--tr "Encrypted Secrets")
+                          'face 'lispm-auth-page-tagline)
               ""
               (lispm-auth--page-row page)
               ""
@@ -782,7 +817,8 @@ one."
       (let ((rule (make-string (max 12 (- lispm-auth-page-width 8)) ?─)))
         (list (propertize title 'face 'lispm-auth-page-title)
               (propertize rule 'face 'lispm-auth-page-rule)
-              (propertize "Encrypted Secrets" 'face 'lispm-auth-page-hint)
+              (propertize (lispm-auth--tr "Encrypted Secrets")
+                          'face 'lispm-auth-page-hint)
               ""
               prompt
               ""
@@ -1015,8 +1051,8 @@ stead.  Nothing is drawn where a display cannot show the logo."
      ((string-empty-p password)
       (setf (plist-get page :message)
             (if (plist-get page :confirm)
-                "Choose a password for LispM's secrets."
-              "Type the password."))
+                (lispm-auth--tr "Choose a password for LispM's secrets.")
+              (lispm-auth--tr "Type the password.")))
       (lispm-auth--page-redraw page))
      ((memq stage '(single current))
       (setf (plist-get page :result) password)
@@ -1035,7 +1071,7 @@ stead.  Nothing is drawn where a display cannot show the logo."
             (lispm-auth--page-slide page)
             (setf (plist-get page :done) t))
         (setf (plist-get page :message)
-              "The passwords do not match.  Try again."
+              (lispm-auth--tr "The passwords do not match.  Try again.")
               (plist-get page :first) nil
               (plist-get page :password) ""
               (plist-get page :stage) 'new)
@@ -1043,7 +1079,8 @@ stead.  Nothing is drawn where a display cannot show the logo."
 
 (defun lispm-auth--page-handle (page event)
   "Answer PAGE's EVENT: a character, keyboard action, or window click."
-  (when (and (consp event) (eq (car event) 'mouse-1)
+  (when (and (consp event)
+             (memq (car event) '(mouse-1 drag-mouse-1 double-mouse-1 triple-mouse-1))
              lispm-auth-page-window-event-function
              (lispm-auth--page-windowed-p page))
     (setq event (funcall lispm-auth-page-window-event-function page event)))
@@ -1067,11 +1104,19 @@ stead.  Nothing is drawn where a display cannot show the logo."
    ((and (integerp event) (>= event 32) (/= event 127))
     (lispm-auth--page-add page event))))
 
+(defun lispm-auth--page-clear-echo ()
+  "Clear echoed keys and any minibuffer message while reading a password."
+  (clear-this-command-keys)
+  (when (and (not noninteractive) (current-message))
+    (let ((message-log-max nil))
+      (message nil))))
+
 (defun lispm-auth--page-read (prompt confirm message)
   "Ask for a password on the page, at PROMPT, twice when CONFIRM is non-nil.
 MESSAGE is shown under the field, as why it is asked again.  Return the
 password, or nil when Escape was pressed."
-  (let ((page (list :prompt prompt
+  (let ((echo-keystrokes 0)
+        (page (list :prompt prompt
                     :confirm (and confirm t)
                     :message message
                     :operation (cond (lispm-auth--changing 'change)
@@ -1099,14 +1144,17 @@ password, or nil when Escape was pressed."
                     :window-configuration nil)))
     (unwind-protect
         (progn
+          (lispm-auth--page-clear-echo)
           (funcall lispm-auth--page-show-function page)
           (while (not (plist-get page :done))
             (condition-case nil
-                (lispm-auth--page-handle
-                 page (funcall lispm-auth--page-event-function))
+                (let ((event (funcall lispm-auth--page-event-function)))
+                  (lispm-auth--page-clear-echo)
+                  (lispm-auth--page-handle page event))
               (quit (setf (plist-get page :result) nil
                           (plist-get page :done) t))))
           (plist-get page :result))
+      (lispm-auth--page-clear-echo)
       (funcall lispm-auth--page-hide-function page))))
 
 (defun lispm-auth--read-password (prompt &optional confirm)
@@ -1118,10 +1166,6 @@ which cannot ask."
         (message "LispM Auth: a password is needed, and this Emacs cannot ask for one")
         nil)
     (lispm-auth--page-read prompt confirm lispm-auth-password-message)))
-
-(defconst lispm-auth--package-directory
-  (file-name-directory (or load-file-name buffer-file-name))
-  "Directory holding LispM Auth and its Common Lisp service.")
 
 (defcustom lispm-auth-service-program nil
   "Absolute filename of the standalone LispM Auth crypto executable.
@@ -1587,8 +1631,8 @@ then for a new one twice, and wraps the data key with the new one."
                  wrong t)
            (when (< attempt lispm-auth-password-attempts)
              (setq lispm-auth-password-message
-                   (format "Wrong password.  Try again (%d of %d)."
-                           attempt lispm-auth-password-attempts))))))))
+                   (lispm-auth--tr "Wrong password.  Try again (%d of %d)."
+                                   attempt lispm-auth-password-attempts))))))))
     (cond
      (changing
       ;; It asks for the old password first, then for the new one twice;
@@ -1651,8 +1695,8 @@ the password is only tried against it."
              (setq attempt (1+ attempt))
              (when (< attempt lispm-auth-password-attempts)
                (setq message
-                     (format "Wrong password.  Try again (%d of %d)."
-                             attempt lispm-auth-password-attempts)))))))))
+                     (lispm-auth--tr "Wrong password.  Try again (%d of %d)."
+                                     attempt lispm-auth-password-attempts)))))))))
     ok))
 
 (defun lispm-auth-change-password (&optional new-password)
