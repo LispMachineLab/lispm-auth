@@ -941,13 +941,19 @@ Every other page fills the window it is shown in, in a terminal too."
         (display-line-numbers-mode -1)))
     (setf (plist-get page :buffer) buffer)
     (when (not noninteractive)
+      (when (and (window-live-p (selected-window))
+                 (or (window-minibuffer-p (selected-window))
+                     (window-dedicated-p (selected-window))
+                     (window-parameter (selected-window) 'window-side)))
+        (when-let* ((main (or (window-main-window (selected-frame))
+                              (frame-first-window (selected-frame)))))
+          (when (window-live-p main)
+            (select-window main))))
       (cond
        ((lispm-auth--page-windowed-p page)
         ;; LispM's own window, as the setup assistant's pages: the frame
         ;; keeps its size and place, and what it showed comes back with
         ;; the page.
-        (when (window-minibuffer-p (selected-window))
-          (select-window (next-window)))
         (let ((frame (selected-frame)))
           (setf (plist-get page :frame) frame
                 (plist-get page :window-configuration)
@@ -964,21 +970,29 @@ Every other page fills the window it is shown in, in a terminal too."
                  (unless (frame-visible-p frame)
                    (set-frame-parameter frame 'visibility t)
                    '((visibility . nil)))))
-          (delete-other-windows)
+          (let ((ignore-window-parameters t))
+            (delete-other-windows))
+          (when (window-live-p (selected-window))
+            (set-window-dedicated-p (selected-window) nil)
+            (dolist (p '(window-side window-slot no-other-window no-delete-other-windows))
+              (set-window-parameter (selected-window) p nil)))
           (switch-to-buffer buffer)
           ;; The window's tab line goes with its buffer, and the page's
           ;; image is drawn to the body it leaves: redisplay first, so
           ;; that the body's size is the one the page is drawn to.
           (redisplay t)))
        (t
-        (when (window-minibuffer-p (selected-window))
-          (select-window (next-window)))
         ;; The frame keeps its size, place and colours; remembering it
         ;; lets the page be drawn to the window's middle.
         (setf (plist-get page :frame) (selected-frame)
               (plist-get page :window-configuration)
               (current-window-configuration))
-        (delete-other-windows)
+        (let ((ignore-window-parameters t))
+          (delete-other-windows))
+        (when (window-live-p (selected-window))
+          (set-window-dedicated-p (selected-window) nil)
+          (dolist (p '(window-side window-slot no-other-window no-delete-other-windows))
+            (set-window-parameter (selected-window) p nil)))
         (switch-to-buffer buffer))))
     (lispm-auth--page-redraw page)))
 
