@@ -1694,5 +1694,42 @@ gone, so that nothing drifts across the page behind it."
         (should (cl-some (lambda (l) (string-search "TR:Return confirms" l)) lines))
         (should (cl-some (lambda (l) (string-search "TR:C-p changes the password" l)) lines))))))
 
+(ert-deftest lispm-auth-test-page-show-clears-side-and-dedicated-windows ()
+  (save-window-excursion
+    (set-frame-size (selected-frame) 80 24)
+    (delete-other-windows)
+    (let* ((main-buf (get-buffer-create " *auth-test-main*"))
+           (side-buf (get-buffer-create " *auth-test-side*"))
+           (page-buf (get-buffer-create " *LispM Password*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer main-buf)
+            (let ((side-win (display-buffer-in-side-window
+                             side-buf '((side . top)
+                                        (window-height . 4)
+                                        (dedicated . t)
+                                        (window-parameters
+                                         (no-delete-other-windows . t)
+                                         (no-other-window . t))))))
+              (select-window side-win)
+              (should (= (length (window-list)) 2))
+              (should (window-dedicated-p (selected-window)))
+              (let ((noninteractive nil)
+                    (page (list :buffer nil :frame nil
+                                :window-configuration nil
+                                :frame-parameters nil
+                                :password "" :first nil :stage 'single)))
+                (cl-letf (((symbol-function 'redisplay) #'ignore))
+                  (lispm-auth--page-show page))
+                (should (= (length (window-list)) 1))
+                (should (eq (window-buffer (selected-window)) page-buf))
+                (should-not (window-dedicated-p (selected-window)))
+                (should-not (window-parameter (selected-window) 'window-side))
+                (lispm-auth--page-hide page)
+                (should (= (length (window-list)) 2)))))
+        (when (buffer-live-p page-buf) (kill-buffer page-buf))
+        (when (buffer-live-p main-buf) (kill-buffer main-buf))
+        (when (buffer-live-p side-buf) (kill-buffer side-buf))))))
+
 (provide 'lispm-auth-test)
 ;;; lispm-auth-test.el ends here
