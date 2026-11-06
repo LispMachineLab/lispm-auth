@@ -1190,12 +1190,13 @@ shell, Lisp interpreter, or source-file fallback is used."
   :type '(choice (const :tag "Package executable" nil) file)
   :group 'lispm-auth)
 
-(defconst lispm-auth-service-version "v0.2.0"
+(defconst lispm-auth-service-version "v0.2.6"
   "Fixed service release used by this client; never a moving latest URL.")
 
 (defconst lispm-auth-service-sha256
-  '(("darwin-arm64" . "f5e5a8308f3ab745bef0654ce07ffaebb9ee1b503f8c83c4bd558224349968bf")
-    ("linux-x86_64" . "77364fa76e1a2ae5f7a5a13b43d3ed6f45479ca84fc844f612481e1fd9e0be33"))
+  '(("darwin-arm64" . "a478e67930206b56c5d3f2701b1fefaf20676d8a6b41346696c955d368348b49")
+      ("linux-x86_64" . "3bc755735cb06d58ed2c836db805bbc6ef818db7e7596a5a9c6147b22876151f")
+      ("linux-arm64" . "1158c5f9ef7f62951be910fd52e988a10b92ff0e22ffa15b350348db138c5800"))
   "Alist of (PLATFORM . SHA256) pins for the fixed service release.
 Published assets were independently verified against the tested CI artifacts.
 Never obtain trusted hashes from the same download as the executable.")
