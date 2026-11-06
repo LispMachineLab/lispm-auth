@@ -4,7 +4,7 @@
 
 ;; Author: Ryan.K
 ;; URL: https://github.com/LispMachineLab/lispm-auth
-;; Version: 0.2.4
+;; Version: 0.2.6
 ;; Package-Requires: ((emacs "30.1"))
 ;; Keywords: tools, data
 ;; SPDX-License-Identifier: AGPL-3.0-or-later
