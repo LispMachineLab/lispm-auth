@@ -15,7 +15,7 @@ secrets, so that only their starts ask for the password.  In code, the prefix is
 
 * Installing the service
 
-The official CI release targets are =darwin-arm64= (macOS 14),
+The official CI release targets are =darwin-arm64= (macOS 15),
 =linux-x86_64= (glibc, Ubuntu 22.04) and =linux-arm64= (glibc, Ubuntu 24.04).
 Intel Macs are no longer supported. Intel Emacs under Rosetta is also unsupported; on Apple
 Silicon, use native ARM64 Emacs. The client rejects Intel macOS before downloading or running

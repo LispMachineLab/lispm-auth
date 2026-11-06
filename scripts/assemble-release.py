@@ -134,7 +134,7 @@ def assemble(inputs, output, source, version, commit):
         f"LispM Auth {version}\n\nBuilt and tested by CI from {commit}.\n\n"
         "Use the lispm-auth-client archive: its generated lispm-auth.el pins these exact three service archives. "
         "The bare git tag is build input and does not contain the post-build pins.\n\n"
-        "Platforms: macOS 14 ARM64, Ubuntu 22.04 x86_64, Ubuntu 24.04 ARM64 (glibc). Intel macOS is no longer supported. "
+        "Platforms: macOS 15 ARM64, Ubuntu 22.04 x86_64, Ubuntu 24.04 ARM64 (glibc). Intel macOS is no longer supported. "
         "Older systems, musl and Windows are not supported. macOS signatures are ad-hoc, not notarized.\n\n"
         "Each platform dependency-sources archive contains SOURCE-PROVENANCE.json, exact vendor sources/patches "
         "and BUILD-AND-RELINK.txt. The project source archive contains build scripts and license. "
