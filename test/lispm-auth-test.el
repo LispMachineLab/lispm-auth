@@ -190,9 +190,11 @@ An explicitly supplied but invalid executable is an error, not a skip."
 
 (ert-deftest lispm-auth-test-service-resolver-package-artifact ()
   "The default resolves only the packaged executable for this platform."
-  (let ((lispm-auth-service-program nil)
-        (lispm-auth--package-directory
-         (file-name-as-directory (make-temp-file "lispm-auth-package-" t))))
+  (let* ((lispm-auth-service-program nil)
+         (lispm-auth--package-directory
+          (file-name-as-directory (make-temp-file "lispm-auth-package-" t)))
+         (lispm-auth-service-directory
+          (expand-file-name "installed/" lispm-auth--package-directory)))
     (unwind-protect
         (let* ((platform (lispm-auth--service-platform))
                (file (and platform (expand-file-name
@@ -1564,7 +1566,7 @@ application opened on its own starts LispM, and hides it with the page."
       (kill-buffer buffer))))
 
 (ert-deftest lispm-auth-test-page-logo-takes-the-fields-place ()
-  "While the logo goes to the field's place the rule and the field are
+  "While the logo slides to the page's centre the rule and the field are
 gone, so that nothing drifts across the page behind it."
   (let ((buffer (get-buffer-create " *LispM Password Test*"))
         (page (list :prompt "LispM password: " :confirm nil :message nil
@@ -1588,23 +1590,34 @@ gone, so that nothing drifts across the page behind it."
                     ((symbol-function 'frame-char-height) (lambda (&optional _) 20))
                     ((symbol-function 'string-pixel-width)
                      (lambda (string) (* 10 (string-width string)))))
-            (lispm-auth--page-redraw page))
-          (with-current-buffer buffer
-            (let* ((start (text-property-not-all (point-min) (point-max)
-                                                 'lispm-auth-page-row nil))
-                   (end (next-single-property-change start
-                                                     'lispm-auth-page-row))
-                   (row (get-text-property start 'lispm-auth-page-row))
-                   (logo (text-property-not-all (point-min) (point-max)
-                                                'lispm-auth-page-logo nil)))
-              (should row)
-              (should logo)
-              (should (eq (get-text-property logo 'lispm-auth-page-logo) 'logo))
-              ;; Only the logo's stretch space and the logo are left.
-              (should (= (length (buffer-substring start end)) 2))
-              (should-not (text-property-not-all
-                           (point-min) (point-max)
-                           'lispm-auth-page-field-image nil)))))
+            (lispm-auth--page-redraw page)
+            (with-current-buffer buffer
+              (let* ((start (text-property-not-all (point-min) (point-max)
+                                                   'lispm-auth-page-row nil))
+                     (end (next-single-property-change start
+                                                       'lispm-auth-page-row))
+                     (row (get-text-property start 'lispm-auth-page-row))
+                     (logo (text-property-not-all (point-min) (point-max)
+                                                  'lispm-auth-page-logo nil)))
+                (should row)
+                (should logo)
+                (should (eq (get-text-property logo 'lispm-auth-page-logo) 'logo))
+                ;; Only the logo's stretch space and the logo are left.
+                (should (= (length (buffer-substring start end)) 2))
+                (should-not (text-property-not-all
+                             (point-min) (point-max)
+                             'lispm-auth-page-field-image nil))
+                ;; At slide 0.5, logo-x is halfway between left (531) and centre-x (736).
+                (should (equal (get-text-property start 'display)
+                               '(space :align-to (634))))))
+            (setf (plist-get page :slide) 1.0)
+            (lispm-auth--page-redraw page)
+            (with-current-buffer buffer
+              (let ((start (text-property-not-all (point-min) (point-max)
+                                                  'lispm-auth-page-row nil)))
+                ;; At slide 1.0, the 128px logo is horizontally centred on the 1600px page (x = 736).
+                (should (equal (get-text-property start 'display)
+                               '(space :align-to (736))))))))
       (kill-buffer buffer))))
 
 (ert-deftest lispm-auth-test-change-idle-time-reschedules ()
@@ -1730,6 +1743,97 @@ gone, so that nothing drifts across the page behind it."
         (when (buffer-live-p page-buf) (kill-buffer page-buf))
         (when (buffer-live-p main-buf) (kill-buffer main-buf))
         (when (buffer-live-p side-buf) (kill-buffer side-buf))))))
+
+(ert-deftest lispm-auth-test-unlock-window-and-fullscreen-modes ()
+  "`lispm-auth-unlock-window' uses windowed mode and `lispm-auth-unlock-fullscreen' uses full-screen mode.
+Starting a solo application uses `lispm-auth-unlock-window', while starting
+`desktop' uses `lispm-auth-unlock-fullscreen'."
+  (let ((modes nil))
+    (cl-letf (((symbol-function 'lispm-auth--check-store-format) #'ignore)
+              ((symbol-function 'lispm-auth--lock-if-stale) #'ignore)
+              ((symbol-function 'lispm-auth-store-exists-p) (lambda () t))
+              ((symbol-function 'lispm-auth--unlock-file)
+               (lambda ()
+                 (push (if lispm-auth-page-windowed 'window 'fullscreen) modes)
+                 t))
+              ((symbol-function 'lispm-auth--migrate) #'ignore))
+      (let ((lispm-auth--unlocked nil)
+            (lispm-auth--migrated t))
+        (should (lispm-auth-unlock-window)))
+      (let ((lispm-auth--unlocked nil)
+            (lispm-auth--migrated t))
+        (should (lispm-auth-unlock-fullscreen)))
+      (let ((lispm-auth--unlocked nil)
+            (lispm-auth--migrated t))
+        (should (lispm-auth-unlock 'window)))
+      (let ((lispm-auth--unlocked nil)
+            (lispm-auth--migrated t))
+        (should (lispm-auth-unlock 'fullscreen)))
+      (let ((lispm-auth--unlocked nil)
+            (lispm-auth--migrated t)
+            (lispm-auth-apps '(desktop))
+            (command-line-args '("emacs")))
+        (should (lispm-auth-start-apps '(desktop))))
+      (let ((lispm-auth--unlocked nil)
+            (lispm-auth--migrated t)
+            (lispm-auth-apps '(desktop))
+            (command-line-args '("emacs")))
+        (should (lispm-auth-start-app 'lispm)))
+      (let ((lispm-auth--unlocked nil)
+            (lispm-auth--migrated t)
+            (lispm-auth-apps '(desktop))
+            (command-line-args '("emacs" "--lispm-hidden")))
+        (should (lispm-auth-start-apps '(desktop))))
+      (should (equal (nreverse modes)
+                     '(window fullscreen window fullscreen fullscreen window window))))))
+
+(ert-deftest lispm-auth-test-builtin-window-draw-and-event ()
+  "Built-in window unlock draws a 520x240 Platinum SVG and handles button clicks."
+  (let ((buffer (get-buffer-create " *LispM Builtin Window Test*"))
+        (page (list :prompt "LispM password: "
+                    :confirm nil
+                    :message nil
+                    :operation 'unlock
+                    :stage 'single
+                    :change t
+                    :password "secret"
+                    :first nil
+                    :result nil
+                    :done nil
+                    :buffer nil
+                    :frame nil
+                    :window-configuration nil)))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer (lispm-auth-page-mode))
+          (setf (plist-get page :buffer) buffer)
+          (let ((lispm-auth-page-windowed t)
+                (lispm-auth-page-window-draw-function nil)
+                (lispm-auth-page-window-event-function nil))
+            (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _) t))
+                      ((symbol-function 'svg-image)
+                       (lambda (svg &rest props) (list 'image svg props))))
+              (should (lispm-auth--page-windowed-p page))
+              (lispm-auth--page-redraw page)
+              (with-current-buffer buffer
+                (let ((disp (get-text-property (point-min) 'display)))
+                  (should (eq (car disp) 'image))))
+              (cl-letf (((symbol-function 'window-body-width) (lambda (&rest _) 520))
+                        ((symbol-function 'window-body-height) (lambda (&rest _) 240))
+                        ((symbol-function 'posn-object-x-y)
+                         (lambda (_pos) '(450 . 210))))
+                (should (eq (lispm-auth--window-page-event
+                             page (list 'mouse-1 (list (selected-window) 1 '(450 . 210) 0)))
+                            'confirm)))
+              (cl-letf (((symbol-function 'window-body-width) (lambda (&rest _) 520))
+                        ((symbol-function 'window-body-height) (lambda (&rest _) 240))
+                        ((symbol-function 'posn-object-x-y)
+                         (lambda (_pos) '(355 . 210))))
+                (should (eq (lispm-auth--window-page-event
+                             page (list 'mouse-1 (list (selected-window) 1 '(355 . 210) 0)))
+                            'cancel))))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
 
 (provide 'lispm-auth-test)
 ;;; lispm-auth-test.el ends here

@@ -4,7 +4,7 @@
 
 ;; Author: Ryan.K
 ;; URL: https://github.com/LispMachineLab/lispm-auth
-;; Version: 0.2.6
+;; Version: 0.2.7
 ;; Package-Requires: ((emacs "30.1"))
 ;; Keywords: tools, data
 ;; SPDX-License-Identifier: AGPL-3.0-or-later
@@ -97,10 +97,37 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'subr-x)
+(require 'svg)
 (require 'url)
 
 (declare-function lispm-backend-secret-id "lispm-settings" (name))
 (declare-function lispm-settings-set "lispm-settings" (variable value &optional save))
+(declare-function lispm-ui-palette-update "lispm-ui-palette" ())
+(declare-function lispm-ui-grey "lispm-ui-palette" (palette level))
+(declare-function lispm-ui-svg-fill "lispm-ui-draw" (svg x y width height color))
+(declare-function lispm-ui-svg-row "lispm-ui-draw" (svg from to y color))
+(declare-function lispm-ui-svg-column "lispm-ui-draw" (svg x from to color))
+(declare-function lispm-ui-svg-embed "lispm-ui-draw" (svg child x y width height))
+(declare-function lispm-ui-svg-content "lispm-ui-draw" (svg content x y height color &optional default-face))
+(declare-function lispm-ui-svg-push-button "lispm-ui-controls" (svg x y palette label width &rest args))
+(declare-function lispm-ui-push-button-width "lispm-ui-controls" (label))
+(declare-function lispm-ui-title-layout "lispm-ui-window" (width title-width &optional controls margins))
+(declare-function lispm-ui-draw-title-part "lispm-ui-window" (palette width &rest args))
+(declare-function lispm-ui-text-width "lispm-ui-text" (string &optional face))
+(declare-function lispm-ui-alert--wrap "lispm-ui-alert" (text width &optional face))
+(declare-function lispm-ui-popup-set-size "lispm-ui-popup" (frame width height))
+(declare-function lispm-ui-icon-file "lispm-ui-icons" (name))
+(declare-function lispm-desktop-apps-screen "lispm-desktop-apps" (&optional frame))
+(declare-function lispm-desktop-apps-hidden-p "lispm-desktop-apps" (&optional screen))
+(declare-function lispm-desktop-coherence--minibuffer "lispm-desktop-coherence" (screen))
+(declare-function lispm-desktop-platinum-scroll-sync "lispm-desktop-platinum-scroll" ())
+(defvar lispm-ui-current-palette)
+(defvar lispm-ui-title-bar-height)
+(defvar lispm-ui-button-height)
+(defvar evil-emacs-state-cursor)
+(defvar evil-normal-state-cursor)
+(defvar evil-insert-state-cursor)
+(defvar evil-motion-state-cursor)
 
 ;; LispM's own, in lispm-core.el; LispM Auth adds nothing to it, and must
 ;; work when LispM is not loaded.
@@ -722,7 +749,7 @@ many times its height, in one line."
 (defun lispm-auth--page-row (page)
   "Return the line showing PAGE's logo, an upright rule, and its field.
 The three are placed at absolute pixels, so that the logo can move to
-the field's place when PAGE's password is answered: `:slide' is how far
+the page's centre when PAGE's password is answered: `:slide' is how far
 along that way it is, from 0 to 1."
   (let* ((window-width (lispm-auth--page-text-width page))
          (logo (lispm-auth--page-logo-image))
@@ -738,20 +765,18 @@ along that way it is, from 0 to 1."
          (divider-x (+ left logo-width (if logo gap 0)))
          (field-x (if logo (+ divider-x divider-width gap) left))
          (slide (plist-get page :slide))
-         (field-centre (+ field-x (/ field-width 2)))
+         (centre-x (max 0 (round (- window-width logo-width) 2)))
          (logo-x (if (and slide logo)
-                     (round (+ left
-                               (* slide (- field-centre
-                                           (+ left (/ logo-width 2))))))
+                     (round (+ left (* slide (- centre-x left))))
                    left)))
     (propertize
      (concat
       (when logo
         (concat (lispm-auth--page-stretch-to logo-x)
                 (propertize " " 'display logo 'lispm-auth-page-logo logo)))
-      ;; The rule and the field are gone while the logo takes the field's
-      ;; place: an absolute position cannot be given to them behind a logo
-      ;; that has passed it, and they would drift across the page.
+      ;; The rule and the field are gone while the logo slides to the
+      ;; page's centre: an absolute position cannot be given to them behind
+      ;; a logo that has passed it, and they would drift across the page.
       (unless slide
         (concat (when divider
                   (concat (lispm-auth--page-stretch-to divider-x)
@@ -882,21 +907,571 @@ is larger than the frame's own still centre on the screen's middle."
                               (cons 0.5 (list (max 1 (string-pixel-width
                                                       line))))))))))
 
+;;;; Windowed unlock page (for solo applications and password setup)
+
+(defconst lispm-auth-window-width 520
+  "Width in pixels of the windowed password dialog.")
+
+(defconst lispm-auth-window-height 240
+  "Height in pixels of the windowed password dialog.")
+
+(defconst lispm-auth--window-margin 20
+  "Pixels left clear between the password window's sides and its contents.")
+
+(defconst lispm-auth--window-frame-inset '(6 . 1)
+  "Where a window's content stands inside its Platinum frame: (LEFT . TOP).")
+
+(defun lispm-auth--window-frame-margins ()
+  "Return (LEFT TOP RIGHT BOTTOM) pixels around the Platinum window frame."
+  (pcase-let ((`(,side . ,top) lispm-auth--window-frame-inset))
+    (list side top (1+ side) (1+ side))))
+
+(defun lispm-auth--window-palette ()
+  "Return the palette the password window is drawn in."
+  (or (bound-and-true-p lispm-ui-current-palette)
+      (and (fboundp 'lispm-ui-palette-update)
+           (ignore-errors (lispm-ui-palette-update)))
+      '(:desktop "#6E6E6E" :content "#FFFFFF" :chrome "#DDDDDD"
+        :light "#FFFFFF" :text "#000000" :muted "#777777"
+        :outline "#000000" :alert-dark "#CE3131")))
+
+(defun lispm-auth--window-grey (palette level)
+  "Return grey LEVEL (0..255) in PALETTE."
+  (if (fboundp 'lispm-ui-grey)
+      (lispm-ui-grey palette level)
+    (format "#%02X%02X%02X" level level level)))
+
+(defun lispm-auth--svg-fill (svg x y width height color)
+  "Fill a rectangle on SVG at X, Y, WIDTH by HEIGHT in COLOR."
+  (if (fboundp 'lispm-ui-svg-fill)
+      (lispm-ui-svg-fill svg x y width height color)
+    (svg-rectangle svg x y width height :fill color :stroke "none")))
+
+(defun lispm-auth--svg-row (svg from to y color)
+  "Draw a horizontal 1px row on SVG from FROM to TO at Y in COLOR."
+  (if (fboundp 'lispm-ui-svg-row)
+      (lispm-ui-svg-row svg from to y color)
+    (when (<= from to)
+      (svg-rectangle svg from y (1+ (- to from)) 1 :fill color :stroke "none"))))
+
+(defun lispm-auth--svg-column (svg x from to color)
+  "Draw a vertical 1px column on SVG at X from FROM to TO in COLOR."
+  (if (fboundp 'lispm-ui-svg-column)
+      (lispm-ui-svg-column svg x from to color)
+    (when (<= from to)
+      (svg-rectangle svg x from 1 (1+ (- to from)) :fill color :stroke "none"))))
+
+(defun lispm-auth--window-fit (string width)
+  "Return STRING shortened with an ellipsis to fit WIDTH pixels."
+  (if (<= (string-pixel-width string) width)
+      string
+    (let ((n (length string))
+          (ellipsis (propertize "…" 'face (get-text-property (max 0 (1- (length string)))
+                                                              'face string))))
+      (while (and (> n 1)
+                  (> (string-pixel-width (concat (substring string 0 n) ellipsis)) width))
+        (setq n (max 1 (min (1- n)
+                            (floor (* n (/ (float width)
+                                           (max 1 (string-pixel-width
+                                                   (substring string 0 n))))))))))
+      (concat (substring string 0 n) ellipsis))))
+
+(defun lispm-auth--draw-window-frame (palette width height &optional active)
+  "Return an SVG of a Platinum window frame WIDTH by HEIGHT pixels in PALETTE."
+  (let* ((w width)
+         (h height)
+         (svg (svg-create w h))
+         (grey (lambda (level) (lispm-auth--window-grey palette level)))
+         (outline (if active (or (plist-get palette :outline) "#000000")
+                    (funcall grey #x55)))
+         (title (or (bound-and-true-p lispm-ui-title-bar-height) 21))
+         (right (- w 2))
+         (bottom (- h 2)))
+    (cl-flet ((row (from to y color) (lispm-auth--svg-row svg from to y color))
+              (column (x from to color) (lispm-auth--svg-column svg x from to color)))
+      (column (1- w) 2 (1- h) (or (plist-get palette :outline) "#000000"))
+      (row 2 (1- w) (1- h) (or (plist-get palette :outline) "#000000"))
+      (lispm-auth--svg-fill svg 1 1 5 (- h 3) (funcall grey (if active #xCC #xDD)))
+      (lispm-auth--svg-fill svg (- w 7) 1 5 (- h 3) (funcall grey (if active #xCC #xDD)))
+      (lispm-auth--svg-fill svg 1 (- h 7) (- w 3) 5 (funcall grey (if active #xCC #xDD)))
+      (if (not active)
+          (progn
+            (column 5 (1+ title) (- h 7) outline)
+            (column (- w 7) (1+ title) (- h 7) outline)
+            (row 5 (- w 7) (- h 7) outline)
+            (row 1 5 title outline)
+            (row (- w 7) (- w 3) title outline))
+        (column 1 1 (- h 4) (funcall grey #xFF))
+        (row 1 (- w 4) (- h 3) (funcall grey #x99))
+        (column (- w 3) 2 (- h 3) (funcall grey #x99))
+        (column 4 (1+ title) (- h 7) (funcall grey #x99))
+        (column (- w 6) (1+ title) (- h 6) (funcall grey #xFF))
+        (row 4 (- w 6) (- h 6) (funcall grey #xFF))
+        (column 5 title (- h 7) outline)
+        (column (- w 7) title (- h 7) outline)
+        (row 5 (- w 7) (- h 7) outline)
+        (row 1 5 1 (funcall grey #xFF))
+        (row (- w 7) (- w 4) 1 (funcall grey #xFF))
+        (row 2 5 (1- title) (funcall grey #x99))
+        (row (- w 7) (- w 4) (1- title) (funcall grey #x99))
+        (row 1 5 title outline)
+        (row (- w 7) (- w 3) title outline))
+      (row 0 right 0 outline)
+      (row 0 right bottom outline)
+      (column 0 0 bottom outline)
+      (column right 0 bottom outline))
+    svg))
+
+(defun lispm-auth--window-title (page)
+  "Return the title of the password window showing PAGE."
+  (if (eq (plist-get page :operation) 'change)
+      (lispm-auth--tr "Change Password")
+    (pcase (plist-get page :stage)
+      ((or 'new 'again) (lispm-auth--tr "Set a Password"))
+      (_ (lispm-auth--page-app-name)))))
+
+(defun lispm-auth--window-label (page)
+  "Return the label of the field PAGE asks its password in."
+  (pcase (plist-get page :stage)
+    ('current (lispm-auth--tr "Current password:"))
+    ('new (lispm-auth--tr "New password:"))
+    ('again (lispm-auth--tr "Repeat password:"))
+    (_ (lispm-auth--tr "Password:"))))
+
+(defun lispm-auth--window-detail (page)
+  "Return what PAGE says under its heading, before its field."
+  (pcase (plist-get page :stage)
+    ('new (lispm-auth--tr "Choose a password for LispM's secrets."))
+    ('again (lispm-auth--tr "Enter the new password again."))
+    (_ (lispm-auth--tr "Enter the password for LispM's secrets."))))
+
+(defun lispm-auth--window-answer (page)
+  "Return what PAGE says under its field: the message, or what Return does."
+  (if-let* ((message (plist-get page :message)))
+      (lispm-auth--tr message)
+    (pcase (plist-get page :stage)
+      ('new (lispm-auth--tr "It is asked for at each start, and cannot be recovered."))
+      ('again (lispm-auth--tr "It is asked for at each start."))
+      ('current (lispm-auth--tr "Return verifies the current password."))
+      (_ (lispm-auth--tr "Return opens the store.")))))
+
+(defun lispm-auth--window-lock (svg palette x y size)
+  "Draw a padlock SIZE pixels square on SVG at X, Y, in PALETTE."
+  (let* ((unit (/ size 32.0))
+         (ink (or (plist-get palette :text) "#000000"))
+         (metal (lispm-auth--window-grey palette #xC8))
+         (lit (lispm-auth--window-grey palette #xFF)))
+    (svg-circle svg (+ x (* unit 16)) (+ y (* unit 12)) (* unit 7)
+                :fill "none" :stroke ink :stroke-width (* unit 2.5))
+    (svg-rectangle svg (+ x (* unit 5)) (+ y (* unit 12))
+                   (* unit 22) (* unit 16) :rx (* unit 2)
+                   :fill metal :stroke ink :stroke-width (* unit 1.5))
+    (lispm-auth--svg-fill svg (+ x (* unit 7)) (+ y (* unit 14))
+                          (* unit 18) 1 lit)
+    (svg-circle svg (+ x (* unit 16)) (+ y (* unit 18)) (* unit 2.2)
+                :fill ink :stroke "none")
+    (svg-rectangle svg (+ x (* unit 15.1)) (+ y (* unit 18))
+                   (* unit 1.8) (* unit 5) :fill ink :stroke "none")))
+
+(defun lispm-auth--window-field (svg palette page x y width height)
+  "Draw PAGE's masked password field on SVG at X, Y, WIDTH by HEIGHT pixels."
+  (svg-rectangle svg x y width height
+                 :fill (or (plist-get palette :content) "#FFFFFF")
+                 :stroke (or (plist-get palette :outline) "#000000")
+                 :stroke-width 1)
+  (let* ((password (or (plist-get page :password) ""))
+         (padding 7)
+         (step 9)
+         (left (+ x padding))
+         (centre (+ y (/ height 2)))
+         (dots (min (length password) (max 1 (/ (- width (* 2 padding)) step)))))
+    (dotimes (index dots)
+      (svg-circle svg (+ left 4 (* index step)) centre 3
+                  :fill (or (plist-get palette :text) "#000000")
+                  :stroke "none"))
+    (lispm-auth--svg-fill svg (+ left (* dots step)) (- centre 6) 1 12
+                          (or (plist-get palette :outline) "#000000"))))
+
+(defun lispm-auth--window-buttons (cx cw cy ch)
+  "Return the Cancel and Confirm button bounds inside CX, CW, CY, CH."
+  (let* ((cancel-label (lispm-auth--tr "Cancel"))
+         (confirm-label (lispm-auth--tr "Confirm"))
+         (cancel-w (max 80 (if (fboundp 'lispm-ui-push-button-width)
+                               (lispm-ui-push-button-width cancel-label)
+                             80)))
+         (confirm-w (max 80 (if (fboundp 'lispm-ui-push-button-width)
+                                (lispm-ui-push-button-width confirm-label)
+                              80)))
+         (right (- (+ cx cw) lispm-auth--window-margin))
+         (confirm-x (- right confirm-w 10))
+         (cancel-x (- confirm-x cancel-w 10))
+         (button-y (- (+ cy ch) 30)))
+    (list :y button-y
+          :cancel (list cancel-x cancel-w cancel-label)
+          :confirm (list confirm-x confirm-w confirm-label))))
+
+(defun lispm-auth--window-svg-text (svg text x y height color &optional face)
+  "Render TEXT on SVG at X, Y with HEIGHT and COLOR."
+  (if (fboundp 'lispm-ui-svg-content)
+      (lispm-ui-svg-content svg text x y height color (or face 'default))
+    (svg-text svg (substring-no-properties text)
+              :x x :y (+ y (- height 4))
+              :font-family "Helvetica Neue, Helvetica, Arial"
+              :font-size (max 11 (- height 4))
+              :fill color)))
+
+(defun lispm-auth--window-svg (width height page palette)
+  "Return an SVG WIDTH by HEIGHT pixels of PAGE as a Platinum window."
+  (ignore-errors (require 'lispm-ui nil t))
+  (let* ((w lispm-auth-window-width)
+         (h lispm-auth-window-height)
+         (x (max 0 (/ (- width w) 2)))
+         (y (max 0 (/ (- height h) 2)))
+         (svg (svg-create width height))
+         (text (or (plist-get palette :text) "#000000"))
+         (muted (or (plist-get palette :muted) "#777777"))
+         (margin lispm-auth--window-margin)
+         (title-h (or (bound-and-true-p lispm-ui-title-bar-height) 21))
+         (title-face (if (facep 'lispm-ui-title) 'lispm-ui-title 'bold))
+         (list-face (if (facep 'lispm-ui-list) 'lispm-ui-list 'default))
+         (small-face (if (facep 'lispm-ui-small) 'lispm-ui-small 'default))
+         (title (propertize (lispm-auth--window-title page) 'face title-face)))
+    (lispm-auth--svg-fill svg 0 0 width height
+                          (if (or (> width w) (> height h))
+                              (or (plist-get palette :desktop) "#6E6E6E")
+                            (lispm-auth--window-grey palette #xDD)))
+    (pcase-let* ((`(,left ,top ,right ,bottom) (lispm-auth--window-frame-margins))
+                 (cx (+ x left))
+                 (cy (+ y top title-h))
+                 (cw (- w left right))
+                 (ch (- h top bottom title-h))
+                 (field-width (- cw (* 2 margin))))
+      (if (fboundp 'lispm-ui-svg-embed)
+          (lispm-ui-svg-embed
+           svg (lispm-auth--draw-window-frame palette w h t) x y w h)
+        (lispm-auth--svg-fill svg x y w h (lispm-auth--window-grey palette #xDD)))
+      (if (and (fboundp 'lispm-ui-title-layout)
+               (fboundp 'lispm-ui-draw-title-part)
+               (fboundp 'lispm-ui-svg-embed))
+          (let* ((tw (if (fboundp 'lispm-ui-text-width)
+                         (lispm-ui-text-width title title-face)
+                       (string-pixel-width title)))
+                 (bar (lispm-ui-title-layout cw tw '(nil nil nil))))
+            (lispm-ui-svg-embed
+             svg (lispm-ui-draw-title-part
+                  palette cw :active t :ridges (plist-get bar :ridges)
+                  :label (lispm-auth--window-fit title (plist-get bar :title))
+                  :label-x (plist-get bar :label-x))
+             cx (1+ y) cw title-h))
+        (lispm-auth--svg-fill svg cx (1+ y) cw title-h (lispm-auth--window-grey palette #xCC))
+        (lispm-auth--window-svg-text svg title (+ cx (/ cw 3)) (1+ y) title-h text title-face))
+      (lispm-auth--svg-fill svg cx cy cw ch (lispm-auth--window-grey palette #xDD))
+      (lispm-auth--window-lock svg palette (+ cx margin) (+ cy 16) 32)
+      (lispm-auth--window-svg-text
+       svg (propertize (if (eq (plist-get page :operation) 'change)
+                           (lispm-auth--tr "Change Password")
+                         (lispm-auth--tr "Encrypted Secrets"))
+                       'face '(:height 1.4))
+       (+ cx 68) (+ cy 12) 26 text title-face)
+      (let* ((top (+ cy 42))
+             (detail (lispm-auth--window-detail page))
+             (detail-lines (if (fboundp 'lispm-ui-alert--wrap)
+                               (lispm-ui-alert--wrap detail (- cw 88) list-face)
+                             (list detail))))
+        (dolist (line detail-lines)
+          (lispm-auth--window-svg-text svg line (+ cx 68) top 16 text list-face)
+          (setq top (+ top 16)))
+        (setq top (+ top 18))
+        (lispm-auth--window-svg-text svg (lispm-auth--window-label page)
+                                     (+ cx margin) top 16 text list-face)
+        (setq top (+ top 20))
+        (lispm-auth--window-field svg palette page (+ cx margin) top field-width 22)
+        (setq top (+ top 32))
+        (let* ((color (if (plist-get page :message)
+                          (or (plist-get palette :alert-dark) "#CE3131")
+                        muted))
+               (ans (lispm-auth--window-answer page))
+               (ans-lines (if (fboundp 'lispm-ui-alert--wrap)
+                              (lispm-ui-alert--wrap ans field-width list-face)
+                            (list ans))))
+          (dolist (line ans-lines)
+            (lispm-auth--window-svg-text svg line (+ cx margin) top 16 color list-face)
+            (setq top (+ top 16)))))
+      (lispm-auth--svg-fill svg (+ cx margin) (- (+ cy ch) 40) field-width 1
+                            (lispm-auth--window-grey palette #xB4))
+      (lispm-auth--svg-fill svg (+ cx margin) (- (+ cy ch) 39) field-width 1
+                            (lispm-auth--window-grey palette #xFF))
+      (pcase-let* ((buttons (lispm-auth--window-buttons cx cw cy ch))
+                   (button-y (plist-get buttons :y))
+                   (`(,cancel-x ,cancel-w ,cancel-label) (plist-get buttons :cancel))
+                   (`(,confirm-x ,confirm-w ,confirm-label) (plist-get buttons :confirm))
+                   (change (and (plist-get page :change)
+                                (lispm-auth--tr "C-p changes the password"))))
+        (if (fboundp 'lispm-ui-svg-push-button)
+            (progn
+              (lispm-ui-svg-push-button svg cancel-x button-y palette cancel-label cancel-w)
+              (lispm-ui-svg-push-button svg confirm-x button-y palette confirm-label confirm-w))
+          (svg-rectangle svg cancel-x button-y cancel-w 20 :rx 3 :fill "#DDDDDD" :stroke "#000000")
+          (lispm-auth--window-svg-text svg cancel-label (+ cancel-x 14) (+ button-y 2) 16 text list-face)
+          (svg-rectangle svg confirm-x button-y confirm-w 20 :rx 3 :fill "#DDDDDD" :stroke "#000000")
+          (lispm-auth--window-svg-text svg confirm-label (+ confirm-x 14) (+ button-y 2) 16 text list-face))
+        (when change
+          (lispm-auth--window-svg-text svg change (+ cx margin) button-y 16 muted small-face)))
+      svg)))
+
+(defun lispm-auth--window-page-event (_page event)
+  "Map a mouse EVENT on PAGE's buttons to an Auth action (`cancel' or `confirm')."
+  (let* ((posn (or (event-end event) (event-start event)))
+         (window (posn-window posn))
+         (xy (posn-object-x-y posn)))
+    (when (and (windowp window) (consp xy))
+      (let* ((width (window-body-width window t))
+             (height (window-body-height window t))
+             (w lispm-auth-window-width)
+             (h lispm-auth-window-height)
+             (x (max 0 (/ (- width w) 2)))
+             (y (max 0 (/ (- height h) 2)))
+             (title-h (or (bound-and-true-p lispm-ui-title-bar-height) 21))
+             (btn-h (or (bound-and-true-p lispm-ui-button-height) 20)))
+        (pcase-let* ((`(,left ,top ,right ,bottom) (lispm-auth--window-frame-margins))
+                     (cx (+ x left))
+                     (cy (+ y top title-h))
+                     (cw (- w left right))
+                     (ch (- h top bottom title-h))
+                     (buttons (lispm-auth--window-buttons cx cw cy ch))
+                     (button-y (plist-get buttons :y))
+                     (`(,cancel-x ,cancel-w ,_) (plist-get buttons :cancel))
+                     (`(,confirm-x ,confirm-w ,_) (plist-get buttons :confirm)))
+          (when (and (<= button-y (cdr xy))
+                     (< (cdr xy) (+ button-y btn-h)))
+            (cond ((and (<= cancel-x (car xy)) (< (car xy) (+ cancel-x cancel-w))) 'cancel)
+                  ((and (<= confirm-x (car xy)) (< (car xy) (+ confirm-x confirm-w))) 'confirm))))))))
+
+(defun lispm-auth--hide-page-cursor (&optional page)
+  "Hide the cursor in PAGE's buffer and window."
+  (let ((buf (or (and page (plist-get page :buffer))
+                 (get-buffer " *LispM Password*"))))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (setq-local cursor-type nil
+                    cursor-in-non-selected-windows nil
+                    evil-emacs-state-cursor '(nil)
+                    evil-normal-state-cursor '(nil)
+                    evil-insert-state-cursor '(nil)
+                    evil-motion-state-cursor '(nil)))
+      (when-let* ((win (get-buffer-window buf t))
+                  ((window-live-p win)))
+        (internal-show-cursor win nil)
+        (when (and (window-parameter win 'lispm-desktop-platinum-scroll-frame)
+                   (fboundp 'lispm-desktop-platinum-scroll-sync))
+          (lispm-desktop-platinum-scroll-sync))
+        (set-window-scroll-bars win 0 nil 0 nil)))))
+
+(defun lispm-auth--window-page-draw (page)
+  "Draw PAGE as a 520x240 Platinum password window in its buffer."
+  (setq-local left-fringe-width 0
+              right-fringe-width 0
+              left-margin-width 0
+              right-margin-width 0
+              vertical-scroll-bar nil
+              horizontal-scroll-bar nil
+              auto-hscroll-mode nil
+              hscroll-margin 0
+              scroll-margin 0
+              fringe-indicator-alist nil)
+  (let ((table (or buffer-display-table
+                   (setq buffer-display-table (make-display-table)))))
+    (set-display-table-slot table 'truncation (vector))
+    (set-display-table-slot table 'wrap (vector)))
+  (let* ((frame (plist-get page :frame))
+         (window (get-buffer-window (current-buffer) t))
+         (palette (lispm-auth--window-palette))
+         (child-p (and (framep frame)
+                       (or (frame-parent frame)
+                           (frame-parameter frame 'lispm-auth-dialog)
+                           (frame-parameter frame 'lispm-desktop-auth-dialog))))
+         (bg (if child-p
+                 (lispm-auth--window-grey palette #xDD)
+               (or (plist-get palette :desktop) "#6E6E6E"))))
+    (when (and (windowp window) (window-live-p window))
+      (when (and (window-parameter window 'lispm-desktop-platinum-scroll-frame)
+                 (fboundp 'lispm-desktop-platinum-scroll-sync))
+        (lispm-desktop-platinum-scroll-sync))
+      (set-window-scroll-bars window 0 nil 0 nil)
+      (set-window-fringes window 0 0)
+      (set-window-margins window 0 0))
+    (let ((width (if window (window-body-width window t)
+                   (if (framep frame) (frame-pixel-width frame) 520)))
+          (height (if window (window-body-height window t)
+                    (if (framep frame) (frame-pixel-height frame) 240))))
+      (when (and (framep frame) (frame-live-p frame))
+        (dolist (parameter `((background-color . ,bg)
+                             (foreground-color . ,(or (plist-get palette :text) "#000000"))))
+          (unless (equal (frame-parameter frame (car parameter)) (cdr parameter))
+            (set-frame-parameter frame (car parameter) (cdr parameter))))
+        (set-face-background 'fringe bg frame)
+        (when (window-live-p (minibuffer-window frame))
+          (set-window-fringes (minibuffer-window frame) 0 0)))
+      (insert (propertize " " 'display
+                          (svg-image (lispm-auth--window-svg width height page palette)
+                                     :ascent 100 :scale 1)))
+      (goto-char (point-min))
+      (when (and (windowp window) (window-live-p window))
+        (set-window-point window (point-min))
+        (set-window-start window (point-min) t)
+        (set-window-hscroll window 0)))))
+
+(defvar lispm-auth--minibuffer-frame nil
+  "Hidden minibuffer frame used by standalone Window Unlock dialog frames.")
+
+(defun lispm-auth--dialog-minibuffer-window (&optional _screen)
+  "Return a hidden minibuffer window for a top-level Window Unlock dialog frame."
+  (if (frame-live-p lispm-auth--minibuffer-frame)
+      (minibuffer-window lispm-auth--minibuffer-frame)
+    (let ((after-make-frame-functions nil)
+          (before-make-frame-hook nil))
+      (setq lispm-auth--minibuffer-frame
+            (make-frame '((minibuffer . only)
+                          (visibility . nil)
+                          (undecorated . t)
+                          (no-accept-focus . t)
+                          (no-focus-on-map . t)
+                          (no-other-frame . t)
+                          (skip-taskbar . t)
+                          (desktop-dont-save . t)
+                          (menu-bar-lines . 0)
+                          (tool-bar-lines . 0)
+                          (tab-bar-lines . 0)
+                          (width . 10)
+                          (height . 1))))
+      (minibuffer-window lispm-auth--minibuffer-frame))))
+
+(defvar lispm-auth--force-fullscreen nil
+  "Non-nil when `lispm-auth-unlock-fullscreen' forces full-screen unlock.")
+
+(defun lispm-auth--started-hidden-p ()
+  "Return non-nil when the desktop frame is hidden out of sight."
+  (if (fboundp 'lispm-desktop-apps-hidden-p)
+      (lispm-desktop-apps-hidden-p)
+    (and (member "--lispm-hidden" command-line-args) t)))
+
+(defun lispm-auth--call-in-window (function)
+  "Call FUNCTION in a standalone 520x240 Window Unlock dialog frame."
+  (lispm-auth--page-clear-echo)
+  (let ((echo-keystrokes 0)
+        (inhibit-message t)
+        (lispm-auth-page-windowed t))
+    (lispm-auth--call-in-window-1 function)))
+
+(defun lispm-auth--call-in-window-1 (function)
+  "Open a 520x240 dialog frame on a graphical display and call FUNCTION in it."
+  (if (or noninteractive
+          (not (display-graphic-p))
+          (eq lispm-auth-password-function #'read-passwd)
+          (not (eq lispm-auth--page-show-function #'lispm-auth--page-show))
+          (frame-parameter (selected-frame) 'lispm-auth-dialog)
+          (frame-parameter (selected-frame) 'lispm-desktop-auth-dialog))
+      (funcall function)
+    (ignore-errors (require 'lispm-ui nil t))
+    (let* ((previous (selected-frame))
+           (screen (if (fboundp 'lispm-desktop-apps-screen)
+                       (lispm-desktop-apps-screen)
+                     previous))
+           (parent (and (not (lispm-auth--started-hidden-p))
+                        (or (not (framep screen))
+                            (and (frame-live-p screen)
+                                 (frame-visible-p screen)
+                                 (not (frame-parameter screen 'lispm-desktop-hidden))
+                                 (not (frame-parameter screen 'lispm-desktop-window))))
+                        screen))
+           (screen-w (if parent (frame-pixel-width screen) (display-pixel-width)))
+           (screen-h (if parent (frame-pixel-height screen) (display-pixel-height)))
+           (width (min lispm-auth-window-width screen-w))
+           (height (min lispm-auth-window-height screen-h))
+           (palette (lispm-auth--window-palette))
+           (after-make-frame-functions nil)
+           (before-make-frame-hook nil)
+           (frame (make-frame `((parent-frame . ,parent)
+                                (lispm-auth-dialog . t)
+                                (lispm-desktop-auth-dialog . t)
+                                (z-group . ,(unless parent 'above))
+                                (minibuffer . ,(unless parent
+                                                 (lispm-auth--dialog-minibuffer-window screen)))
+                                (undecorated . t)
+                                (visibility . nil)
+                                (no-accept-focus . nil)
+                                (left . ,(max 0 (/ (- screen-w width) 2)))
+                                (top . ,(max 0 (/ (- screen-h height) 2)))
+                                (width . (text-pixels . ,width))
+                                (height . (text-pixels . ,height))
+                                (background-color . ,(lispm-auth--window-grey palette #xDD))
+                                (foreground-color . ,(or (plist-get palette :text) "#000000"))
+                                (internal-border-width . 0)
+                                (child-frame-border-width . 0)
+                                (left-fringe . 0)
+                                (right-fringe . 0)
+                                (vertical-scroll-bars . nil)
+                                (horizontal-scroll-bars . nil)
+                                (menu-bar-lines . 0)
+                                (tool-bar-lines . 0)
+                                (tab-bar-lines . 0)
+                                (unsplittable . t)
+                                (no-other-frame . t)
+                                (no-special-glyphs . t)
+                                (line-spacing . 0)
+                                (cursor-type . nil)
+                                (desktop-dont-save . t)))))
+      (unwind-protect
+          (progn
+            (let ((window (frame-root-window frame)))
+              (when (window-live-p window)
+                (set-window-fringes window 0 0)
+                (set-window-margins window 0 0)))
+            (if (fboundp 'lispm-ui-popup-set-size)
+                (lispm-ui-popup-set-size frame width height)
+              (let ((frame-resize-pixelwise t))
+                (set-frame-size frame width height t)))
+            (make-frame-visible frame)
+            (when (and (not parent) (framep screen) (frame-live-p screen)
+                       (or (lispm-auth--started-hidden-p)
+                           (frame-parameter screen 'lispm-desktop-hidden))
+                       (frame-visible-p screen))
+              (ignore-errors (make-frame-invisible screen t)))
+            (raise-frame frame)
+            (select-frame-set-input-focus frame)
+            (with-selected-frame frame (funcall function)))
+        (when (frame-live-p frame)
+          (ignore-errors (set-frame-position frame -10000 -10000))
+          (ignore-errors (make-frame-invisible frame t))
+          (delete-frame frame t))
+        (when (and (not parent) (framep screen) (frame-live-p screen)
+                   (or (lispm-auth--started-hidden-p)
+                       (frame-parameter screen 'lispm-desktop-hidden))
+                   (frame-visible-p screen))
+          (ignore-errors (make-frame-invisible screen t)))
+        (when (frame-live-p previous)
+          (if (and (not (lispm-auth--started-hidden-p))
+                   (or (not (framep previous)) (frame-visible-p previous)))
+              (select-frame-set-input-focus previous)
+            (select-frame previous 'norecord)))))))
+
 (defun lispm-auth--page-windowed-p (page)
-  "Return non-nil when PAGE is drawn as a window by the desktop's function.
+  "Return non-nil when PAGE is drawn as a window.
 The pages that set a password are windows, as the setup assistant's
 pages are, and so is the whole flow that changes one, which Control
 Panels keeps; so is every page when `lispm-auth-page-windowed' says the
 start is an application's own.  The page that asks for the password a
 store already has, at LispM's own start, is not: it fills the window."
   (and (display-graphic-p)
-       lispm-auth-page-window-draw-function
+       (or lispm-auth-page-window-draw-function
+           (fboundp 'lispm-auth--window-page-draw))
        (or lispm-auth-page-windowed
            lispm-auth--changing
            (memq (plist-get page :stage) '(new again)))))
 
 (defun lispm-auth--page-redraw (page)
   "Draw PAGE in its buffer as it stands now."
+  (lispm-auth--hide-page-cursor page)
   (let ((buffer (plist-get page :buffer)))
     (when (buffer-live-p buffer)
       (let* ((frame (plist-get page :frame))
@@ -907,7 +1482,9 @@ store already has, at LispM's own start, is not: it fills the window."
             (erase-buffer)
             (cond
              ((lispm-auth--page-windowed-p page)
-              (funcall lispm-auth-page-window-draw-function page))
+              (funcall (or lispm-auth-page-window-draw-function
+                           #'lispm-auth--window-page-draw)
+                       page))
              (graphic
               (insert (make-string (lispm-auth--page-top-lines lines page)
                                    ?\n))
@@ -991,9 +1568,12 @@ Every other page fills the window it is shown in, in a terminal too."
           (delete-other-windows))
         (when (window-live-p (selected-window))
           (set-window-dedicated-p (selected-window) nil)
+          (set-window-fringes (selected-window) 0 0)
+          (set-window-margins (selected-window) 0 0)
           (dolist (p '(window-side window-slot no-other-window no-delete-other-windows))
             (set-window-parameter (selected-window) p nil)))
-        (switch-to-buffer buffer))))
+        (switch-to-buffer buffer)
+        (redisplay t))))
     (lispm-auth--page-redraw page)))
 
 (defun lispm-auth--page-hide (page)
@@ -1093,11 +1673,13 @@ stead.  Nothing is drawn where a display cannot show the logo."
 
 (defun lispm-auth--page-handle (page event)
   "Answer PAGE's EVENT: a character, keyboard action, or window click."
-  (when (and (consp event)
-             (memq (car event) '(mouse-1 drag-mouse-1 double-mouse-1 triple-mouse-1))
-             lispm-auth-page-window-event-function
-             (lispm-auth--page-windowed-p page))
-    (setq event (funcall lispm-auth-page-window-event-function page event)))
+  (let ((event-fn (or lispm-auth-page-window-event-function
+                      #'lispm-auth--window-page-event)))
+    (when (and (consp event)
+               (memq (car event) '(mouse-1 drag-mouse-1 double-mouse-1 triple-mouse-1))
+               event-fn
+               (lispm-auth--page-windowed-p page))
+      (setq event (funcall event-fn page event))))
   (cond
    ((or (eq event 'confirm) (eq event 'return) (eq event 'kp-enter)
         (eql event ?\r) (eql event ?\n))
@@ -1125,10 +1707,8 @@ stead.  Nothing is drawn where a display cannot show the logo."
     (let ((message-log-max nil))
       (message nil))))
 
-(defun lispm-auth--page-read (prompt confirm message)
-  "Ask for a password on the page, at PROMPT, twice when CONFIRM is non-nil.
-MESSAGE is shown under the field, as why it is asked again.  Return the
-password, or nil when Escape was pressed."
+(defun lispm-auth--page-read-1 (prompt confirm message)
+  "Show the password page on the selected frame and read a password."
   (let ((echo-keystrokes 0)
         (page (list :prompt prompt
                     :confirm (and confirm t)
@@ -1170,6 +1750,26 @@ password, or nil when Escape was pressed."
           (plist-get page :result))
       (lispm-auth--page-clear-echo)
       (funcall lispm-auth--page-hide-function page))))
+
+(defun lispm-auth--page-read (prompt confirm message)
+  "Ask for a password on the page, at PROMPT, twice when CONFIRM is non-nil.
+MESSAGE is shown under the field, as why it is asked again.  Return the
+password, or nil when Escape was pressed."
+  (if (and (not noninteractive)
+           (display-graphic-p)
+           (not lispm-auth--force-fullscreen)
+           (eq lispm-auth--page-show-function #'lispm-auth--page-show)
+           (not (frame-parameter (selected-frame) 'lispm-auth-dialog))
+           (not (frame-parameter (selected-frame) 'lispm-desktop-auth-dialog))
+           (or lispm-auth-page-windowed
+               (lispm-auth--started-hidden-p)
+               (frame-parameter (selected-frame) 'lispm-desktop-hidden)
+               (frame-parameter (selected-frame) 'lispm-desktop-window)))
+      (let ((lispm-auth-page-windowed t))
+        (lispm-auth--call-in-window
+         (lambda ()
+           (lispm-auth--page-read-1 prompt confirm message))))
+    (lispm-auth--page-read-1 prompt confirm message)))
 
 (defun lispm-auth--read-password (prompt &optional confirm)
   "Ask for a password at PROMPT on the password page.
@@ -1663,24 +2263,69 @@ then for a new one twice, and wraps the data key with the new one."
       (user-error "LispM Auth: wrong password"))
      (t nil))))
 
-(defun lispm-auth-unlock ()
+(defun lispm-auth-unlock-window ()
+  "Open the store using the windowed unlock dialog (for a solo application).
+Return non-nil when the store is open, nil when the user gave no password."
+  (interactive)
+  (let ((lispm-auth-page-windowed t))
+    (if (and (not noninteractive)
+             (display-graphic-p)
+             (eq lispm-auth--page-show-function #'lispm-auth--page-show))
+        (lispm-auth--call-in-window #'lispm-auth-unlock)
+      (lispm-auth-unlock))))
+
+(defun lispm-auth-unlock-fullscreen ()
+  "Open the store using the full-screen unlock page (for the desktop).
+Return non-nil when the store is open, nil when the user gave no password."
+  (interactive)
+  (let* ((lispm-auth-page-windowed nil)
+         (lispm-auth--force-fullscreen t)
+         (screen (and (fboundp 'lispm-desktop-apps-screen)
+                      (lispm-desktop-apps-screen)))
+         (use-screen (and (framep screen) (frame-live-p screen) (frame-visible-p screen)))
+         (children (and use-screen
+                        (cl-loop for f in (frame-list)
+                                 when (and (frame-live-p f)
+                                           (eq (frame-parent f) screen)
+                                           (frame-visible-p f))
+                                 collect f))))
+    (if use-screen
+        (unwind-protect
+            (progn
+              (dolist (child children)
+                (ignore-errors (make-frame-invisible child t)))
+              (with-selected-frame screen
+                (lispm-auth-unlock)))
+          (dolist (child children)
+            (when (frame-live-p child)
+              (ignore-errors (make-frame-visible child)))))
+      (lispm-auth-unlock))))
+
+(defun lispm-auth-unlock (&optional mode)
   "Open the store for this session, asking for its password once.
+MODE may be `window' (open in a standalone 520x240 dialog window, for a
+solo application), `fullscreen' (open on the full-screen lock page, for
+the desktop), or nil (use `lispm-auth-page-windowed').
 Return non-nil when it is open, nil when the user gave no password.
 Make a store with a new password when there is none yet.  Signal
 `user-error' when the password given is not the store's."
-  (lispm-auth--check-store-format)
-  (lispm-auth--lock-if-stale)
-  (if lispm-auth--unlocked
-      t
-    (let ((opened (if (lispm-auth-store-exists-p)
-                      (lispm-auth--unlock-file)
-                    (lispm-auth--create))))
-      (when opened
-        (unless lispm-auth--migrated
-          (setq lispm-auth--migrated t)
-          (lispm-auth--migrate))
-        (setq opened t))
-      opened)))
+  (pcase mode
+    ('window (lispm-auth-unlock-window))
+    ('fullscreen (lispm-auth-unlock-fullscreen))
+    (_
+     (lispm-auth--check-store-format)
+     (lispm-auth--lock-if-stale)
+     (if lispm-auth--unlocked
+         t
+       (let ((opened (if (lispm-auth-store-exists-p)
+                         (lispm-auth--unlock-file)
+                       (lispm-auth--create))))
+         (when opened
+           (unless lispm-auth--migrated
+             (setq lispm-auth--migrated t)
+             (lispm-auth--migrate))
+           (setq opened t))
+         opened)))))
 
 (defun lispm-auth--prompt-allowed-p ()
   "Return non-nil when the store may ask for its password here."
@@ -1812,16 +2457,25 @@ already in the store is left as it is."
   "Open the store when one of APPS, applications, declares secret use.
 APPS are symbols; a password is asked for once, and only when at least
 one of them declares, so that an application that declares nothing
-never touches the encrypted store.  Return non-nil when the store is
-open afterwards.  An error here is shown as a message and answers nil,
-so that it cannot break the start of an application."
-  (when (seq-some #'lispm-auth-app-requires-password-p apps)
-    (let ((lispm-auth--starting-apps apps))
-      (condition-case err
-          (and (lispm-auth-unlock) t)
-        (error
-         (message "LispM Auth: %s" (error-message-string err))
-         nil)))))
+never touches the encrypted store.  When `desktop' is among APPS (and
+Emacs was not started hidden as a solo application), use the full-screen
+unlock page (`lispm-auth-unlock-fullscreen'); otherwise use the windowed
+unlock dialog (`lispm-auth-unlock-window').  Return non-nil when the
+store is open afterwards.  An error here is shown as a message and
+answers nil, so that it cannot break the start of an application."
+  (let ((desktop-p (and (memq 'desktop apps)
+                        (not lispm-auth-page-windowed)
+                        (not (lispm-auth--started-hidden-p)))))
+    (when (seq-some #'lispm-auth-app-requires-password-p apps)
+      (let ((lispm-auth--starting-apps apps))
+        (condition-case err
+            (and (if desktop-p
+                     (lispm-auth-unlock-fullscreen)
+                   (lispm-auth-unlock-window))
+                 t)
+          (error
+           (message "LispM Auth: %s" (error-message-string err))
+           nil))))))
 
 (defun lispm-auth-start-app (app)
   "Open the store at the start of APP, when APP declares secret use.
