@@ -1785,7 +1785,14 @@ Starting a solo application uses `lispm-auth-unlock-window', while starting
             (command-line-args '("emacs" "--lispm-hidden")))
         (should (lispm-auth-start-apps '(desktop))))
       (should (equal (nreverse modes)
-                     '(window fullscreen window fullscreen fullscreen window window))))))
+                     '(window fullscreen window fullscreen fullscreen window window)))
+      ;; When already unlocked, neither windowed nor fullscreen unlock opens a dialog frame.
+      (let ((lispm-auth--unlocked t))
+        (cl-letf (((symbol-function 'lispm-auth--call-in-window)
+                   (lambda (_) (ert-fail "Should not open dialog window when already unlocked")))
+                  ((symbol-function 'lispm-auth--touch) #'ignore))
+          (should (lispm-auth-unlock-window))
+          (should (lispm-auth-unlock-fullscreen)))))))
 
 (ert-deftest lispm-auth-test-builtin-window-draw-and-event ()
   "Built-in window unlock draws a 520x240 Platinum SVG and handles button clicks."
