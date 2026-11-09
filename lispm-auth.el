@@ -1793,13 +1793,13 @@ shell, Lisp interpreter, or source-file fallback is used."
   :type '(choice (const :tag "Package executable" nil) file)
   :group 'lispm-auth)
 
-(defconst lispm-auth-service-version "v0.2.7"
+(defconst lispm-auth-service-version "v0.2.8"
   "Fixed service release used by this client; never a moving latest URL.")
 
 (defconst lispm-auth-service-sha256
-  '(("darwin-arm64" . "2064c72d2ab5de82550f9863bf2a8b3d01d0fd308aded853c17ff7bda75babd1")
-      ("linux-x86_64" . "db7d21ed6acb4bda52a5f728b3544d33ed704b9fc4fe367cb9aafc2448d9857e")
-      ("linux-arm64" . "6c42a06a8103a2bd14416a619ce9a6d0e2a385f507f70510083f97c0e97a4fe2"))
+  '(("darwin-arm64" . "883b7b863260f4c81e3739f9b0fb6948730f2c184cc614c8544b8347b2e3e4d7")
+      ("linux-x86_64" . "fd974f8a1eea6a6b39c7e34e0285d1dd607e2b8ad9c952c231be6ddefb00104e")
+      ("linux-arm64" . "e5d2bad8408e035fcf1956c6cc860b8857b6076d9f8960656cd9777190158677"))
   "Alist of (PLATFORM . SHA256) pins for the fixed service release.
 Published assets were independently verified against the tested CI artifacts.
 Never obtain trusted hashes from the same download as the executable.")
