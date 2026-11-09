@@ -119,6 +119,8 @@
 (declare-function lispm-ui-icon-file "lispm-ui-icons" (name))
 (declare-function lispm-desktop-apps-screen "lispm-desktop-apps" (&optional frame))
 (declare-function lispm-desktop-apps-hidden-p "lispm-desktop-apps" (&optional screen))
+(declare-function lispm-desktop-started-as-terminal-p "lispm-desktop-start-as" ())
+(declare-function lispm-terminal-p "lispm-terminal" (&optional frame))
 (declare-function lispm-desktop-coherence--minibuffer "lispm-desktop-coherence" (screen))
 (declare-function lispm-desktop-platinum-scroll-sync "lispm-desktop-platinum-scroll" ())
 (defvar lispm-ui-current-palette)
@@ -2270,11 +2272,15 @@ Return non-nil when the store is open, nil when the user gave no password."
   (interactive)
   (lispm-auth--check-store-format)
   (lispm-auth--lock-if-stale)
-  (if lispm-auth--unlocked
+  (if (not (lispm-auth-locked-p))
       (progn (lispm-auth--touch) t)
     (let ((lispm-auth-page-windowed t))
       (if (and (not noninteractive)
                (display-graphic-p)
+               (not (and (fboundp 'lispm-desktop-started-as-terminal-p)
+                         (lispm-desktop-started-as-terminal-p)))
+               (not (and (fboundp 'lispm-terminal-p)
+                         (lispm-terminal-p)))
                (eq lispm-auth--page-show-function #'lispm-auth--page-show))
           (lispm-auth--call-in-window #'lispm-auth-unlock)
         (lispm-auth-unlock)))))
@@ -2285,7 +2291,7 @@ Return non-nil when the store is open, nil when the user gave no password."
   (interactive)
   (lispm-auth--check-store-format)
   (lispm-auth--lock-if-stale)
-  (if lispm-auth--unlocked
+  (if (not (lispm-auth-locked-p))
       (progn (lispm-auth--touch) t)
     (let* ((lispm-auth-page-windowed nil)
            (lispm-auth--force-fullscreen t)
@@ -2324,7 +2330,7 @@ Make a store with a new password when there is none yet.  Signal
     (_
      (lispm-auth--check-store-format)
      (lispm-auth--lock-if-stale)
-     (if lispm-auth--unlocked
+     (if (not (lispm-auth-locked-p))
          (progn (lispm-auth--touch) t)
        (let ((opened (if (lispm-auth-store-exists-p)
                          (lispm-auth--unlock-file)
@@ -2472,7 +2478,11 @@ unlock page (`lispm-auth-unlock-fullscreen'); otherwise use the windowed
 unlock dialog (`lispm-auth-unlock-window').  Return non-nil when the
 store is open afterwards.  An error here is shown as a message and
 answers nil, so that it cannot break the start of an application."
-  (let ((desktop-p (and (memq 'desktop apps)
+  (let ((desktop-p (and (or (memq 'desktop apps)
+                            (and (fboundp 'lispm-desktop-started-as-terminal-p)
+                                 (lispm-desktop-started-as-terminal-p))
+                            (and (fboundp 'lispm-terminal-p)
+                                 (lispm-terminal-p)))
                         (not lispm-auth-page-windowed)
                         (not (lispm-auth--started-hidden-p)))))
     (when (seq-some #'lispm-auth-app-requires-password-p apps)

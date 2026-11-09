@@ -1792,7 +1792,17 @@ Starting a solo application uses `lispm-auth-unlock-window', while starting
                    (lambda (_) (ert-fail "Should not open dialog window when already unlocked")))
                   ((symbol-function 'lispm-auth--touch) #'ignore))
           (should (lispm-auth-unlock-window))
-          (should (lispm-auth-unlock-fullscreen)))))))
+          (should (lispm-auth-unlock-fullscreen))))
+      ;; In Focus Mode (`lispm-desktop-started-as-terminal-p' or `lispm-terminal-p'),
+      ;; starting `lispm' uses fullscreen rather than a floating window.
+      (setq modes nil)
+      (let ((lispm-auth--unlocked nil)
+            (lispm-auth--migrated t)
+            (lispm-auth-apps '(desktop))
+            (command-line-args '("emacs")))
+        (cl-letf (((symbol-function 'lispm-desktop-started-as-terminal-p) (lambda () t)))
+          (should (lispm-auth-start-app 'lispm))))
+      (should (equal (nreverse modes) '(fullscreen))))))
 
 (ert-deftest lispm-auth-test-builtin-window-draw-and-event ()
   "Built-in window unlock draws a 520x240 Platinum SVG and handles button clicks."
