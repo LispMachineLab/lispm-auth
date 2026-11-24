@@ -4,7 +4,7 @@
 
 ;; Author: Ryan.K
 ;; URL: https://github.com/LispMachineLab/lispm-auth
-;; Version: 0.2.8
+;; Version: 0.2.9
 ;; Package-Requires: ((emacs "30.1"))
 ;; Keywords: tools, data
 ;; SPDX-License-Identifier: AGPL-3.0-or-later
@@ -448,6 +448,12 @@ key.  nil while the store is locked, and no secret is read then.")
 (defvar lispm-auth--migrated nil
   "Non-nil once backends' literal keys were moved into the store this session.")
 
+(defvar lispm-auth-lock-hook nil
+  "Normal hook run after `lispm-auth-lock' locks the store.")
+
+(defvar lispm-auth-auto-lock-hook nil
+  "Normal hook run after `lispm-auth--auto-lock' locks an expired store.")
+
 (defun lispm-auth--auto-lock-seconds ()
   "Return how long the store may stay unused, in seconds, or nil."
   (and lispm-auth-auto-lock (* 60 lispm-auth-auto-lock)))
@@ -477,7 +483,8 @@ key.  nil while the store is locked, and no secret is read then.")
   (when lispm-auth--unlocked
     (if (lispm-auth--expired-p)
         (progn (lispm-auth-lock)
-               (message "LispM Auth: the store is locked again"))
+               (message "LispM Auth: the store is locked again")
+               (run-hooks 'lispm-auth-auto-lock-hook))
       (lispm-auth--reschedule-auto-lock))))
 
 (defun lispm-auth--reschedule-auto-lock ()
@@ -488,7 +495,8 @@ key.  nil while the store is locked, and no secret is read then.")
               (lispm-auth--last-use))
     (let ((remaining (- seconds (float-time (time-since lispm-auth--last-use)))))
       (if (<= remaining 0)
-          (lispm-auth-lock)
+          (progn (lispm-auth-lock)
+                 (run-hooks 'lispm-auth-auto-lock-hook))
         (setq lispm-auth--lock-timer
               (run-with-timer remaining nil #'lispm-auth--auto-lock))))))
 
@@ -518,13 +526,16 @@ key.  nil while the store is locked, and no secret is read then.")
   "Lock the store, forgetting its data key.
 The store's files are not touched; the next use asks for the password."
   (interactive)
-  (lispm-auth--cancel-lock-timer)
-  (when (stringp lispm-auth--data-key)
-    ;; A best effort: Lisp strings are not promised to be wiped.
-    (ignore-errors (clear-string lispm-auth--data-key)))
-  (setq lispm-auth--data-key nil
-        lispm-auth--unlocked nil
-        lispm-auth--last-use nil))
+  (let ((was-unlocked lispm-auth--unlocked))
+    (lispm-auth--cancel-lock-timer)
+    (when (stringp lispm-auth--data-key)
+      ;; A best effort: Lisp strings are not promised to be wiped.
+      (ignore-errors (clear-string lispm-auth--data-key)))
+    (setq lispm-auth--data-key nil
+          lispm-auth--unlocked nil
+          lispm-auth--last-use nil)
+    (when was-unlocked
+      (run-hooks 'lispm-auth-lock-hook))))
 
 (add-hook 'suspend-resume-hook #'lispm-auth--lock-if-stale)
 
