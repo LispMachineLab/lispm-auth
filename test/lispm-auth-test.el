@@ -1661,6 +1661,25 @@ gone, so that nothing drifts across the page behind it."
           (should (timerp lispm-auth--lock-timer)))
       (lispm-auth--cancel-lock-timer))))
 
+(ert-deftest lispm-auth-test-auto-lock-runs-hooks ()
+  "Locking and auto-locking run `lispm-auth-lock-hook' and `lispm-auth-auto-lock-hook'."
+  (let ((lispm-auth--unlocked t)
+        (lispm-auth--data-key nil)
+        (lispm-auth--last-use (time-subtract (current-time) (seconds-to-time 600)))
+        (lispm-auth--lock-timer nil)
+        (lispm-auth-auto-lock 5)
+        (lock-fired 0)
+        (auto-lock-fired 0))
+    (let ((lispm-auth-lock-hook (list (lambda () (setq lock-fired (1+ lock-fired)))))
+          (lispm-auth-auto-lock-hook (list (lambda () (setq auto-lock-fired (1+ auto-lock-fired))))))
+      (lispm-auth--auto-lock)
+      (should-not lispm-auth--unlocked)
+      (should (= lock-fired 1))
+      (should (= auto-lock-fired 1))
+      ;; Locking an already-locked store does not fire `lispm-auth-lock-hook' again.
+      (lispm-auth-lock)
+      (should (= lock-fired 1)))))
+
 (ert-deftest lispm-auth-test-first-password-is-setup-operation ()
   (let ((lispm-auth-password-function
          (lambda (&rest _) (should-not lispm-auth--changing) nil)))
