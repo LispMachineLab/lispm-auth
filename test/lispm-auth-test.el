@@ -45,9 +45,10 @@
       (should (eq (car (lispm-auth--page-field-image '(:password ""))) 'image)))))
 
 
-;; LispM's own, in lispm-core.el; dynamic here so a test may give the
-;; migration backends of its own.
+;; LispM's own, in lispm-core.el / lispm-secrets.el; dynamic here so tests
+;; can bind them without loading LispM Agent.
 (defvar lispm-backends)
+(defvar lispm-secret-exists-functions)
 
 (defvar lispm-auth-test--answers nil
   "The passwords the stand-in for the prompt answers, oldest first.")
@@ -124,11 +125,14 @@
          (lispm-auth--unlocked nil)
          (lispm-auth--last-use nil)
          (lispm-auth--lock-timer nil)
+         (lispm-auth--auto-lock-notify-timer nil)
+         (lispm-auth--service-verified nil)
          (lispm-auth-auto-lock nil)
          (lispm-auth--migrated nil))
      (unwind-protect
          (progn ,@body)
        (lispm-auth-lock)
+       (lispm-auth--cancel-auto-lock-notify-timer)
        (when (file-directory-p lispm-auth-directory)
          (delete-directory lispm-auth-directory t)))))
 
@@ -799,6 +803,7 @@ Panels has revoked the desktop's declaration."
 (ert-deftest lispm-auth-test-hooks-registered ()
   "Loading LispM Auth adds its handlers to LispM's secret hooks."
   (should (memq #'lispm-auth--secret-get lispm-secret-get-functions))
+  (should (memq #'lispm-auth--secret-exists lispm-secret-exists-functions))
   (should (memq #'lispm-auth--secret-set lispm-secret-set-functions))
   (should (memq #'lispm-auth--secret-delete lispm-secret-delete-functions))
   (should (memq #'lispm-auth--secret-available
@@ -812,14 +817,20 @@ Panels has revoked the desktop's declaration."
                'lispm-secret-available-functions))
       (should-not (run-hook-with-args-until-success
                    'lispm-secret-get-functions "id" t))
+      (should-not (run-hook-with-args-until-success
+                   'lispm-secret-exists-functions "id"))
       (setq lispm-auth-test--answers '("hunter2"))
       (should (run-hook-with-args-until-success
                'lispm-secret-set-functions "id" "sk-secret"))
+      (should (run-hook-with-args-until-success
+               'lispm-secret-exists-functions "id"))
       (should (equal (run-hook-with-args-until-success
                       'lispm-secret-get-functions "id" t)
                      "sk-secret"))
       (should (run-hook-with-args-until-success
                'lispm-secret-delete-functions "id"))
+      (should-not (run-hook-with-args-until-success
+                   'lispm-secret-exists-functions "id"))
       (should-not (run-hook-with-args-until-success
                    'lispm-secret-get-functions "id" t)))))
 
@@ -1679,6 +1690,111 @@ gone, so that nothing drifts across the page behind it."
       ;; Locking an already-locked store does not fire `lispm-auth-lock-hook' again.
       (lispm-auth-lock)
       (should (= lock-fired 1)))))
+
+(ert-deftest lispm-auth-test-no-prompt-does-not-reset-auto-lock ()
+  "Passive no-prompt reads do not refresh `lispm-auth--last-use' or re-arm the timer."
+  (lispm-auth-test--with-service
+    (lispm-auth-test--with-store
+      (lispm-auth-test--make-store "hunter2" (cons "id" "sk-secret"))
+      (let* ((lispm-auth-auto-lock 30)
+             (initial (time-subtract (current-time) (seconds-to-time 600)))
+             (timer (run-with-timer 1200 nil #'ignore)))
+        (unwind-protect
+            (progn
+              (setq lispm-auth--last-use initial
+                    lispm-auth--lock-timer timer)
+              (should (equal (lispm-auth--secret-get "id" t) "sk-secret"))
+              (should (equal lispm-auth--last-use initial))
+              (should (eq lispm-auth--lock-timer timer))
+              ;; Interactive read (`no-prompt' = nil) DOES advance activity and re-arm timer.
+              (should (equal (lispm-auth--secret-get "id" nil) "sk-secret"))
+              (should (time-less-p initial lispm-auth--last-use))
+              (should-not (eq lispm-auth--lock-timer timer)))
+          (when (timerp timer) (cancel-timer timer)))))))
+
+(ert-deftest lispm-auth-test-has-secret-p-does-not-decrypt-or-touch ()
+  "Existence checks inspect the item file without decrypting or extending auto-lock."
+  (lispm-auth-test--with-service
+    (lispm-auth-test--with-store
+      (lispm-auth-test--make-store "hunter2" (cons "id" "sk-secret"))
+      (let* ((lispm-auth-auto-lock 30)
+             (initial (time-subtract (current-time) (seconds-to-time 600)))
+             (timer (run-with-timer 1200 nil #'ignore))
+             (service-calls 0)
+             (orig-service (symbol-function 'lispm-auth--service)))
+        (unwind-protect
+            (cl-letf (((symbol-function 'lispm-auth--service)
+                       (lambda (&rest args)
+                         (setq service-calls (1+ service-calls))
+                         (apply orig-service args))))
+              (setq lispm-auth--last-use initial
+                    lispm-auth--lock-timer timer)
+              (should (lispm-auth-has-secret-p "id"))
+              (should-not (lispm-auth-has-secret-p "missing"))
+              (should (run-hook-with-args-until-success 'lispm-secret-exists-functions "id"))
+              (should-not (run-hook-with-args-until-success 'lispm-secret-exists-functions "missing"))
+              (should (= service-calls 0))
+              (should (equal lispm-auth--last-use initial))
+              (should (eq lispm-auth--lock-timer timer))
+              (lispm-auth-lock)
+              (should-not (lispm-auth-has-secret-p "id")))
+          (when (timerp timer) (cancel-timer timer)))))))
+
+(ert-deftest lispm-auth-test-lock-if-stale-schedules-auto-lock-hook ()
+  "Locking a stale store wipes the data key immediately and schedules auto-lock hooks."
+  (let ((lispm-auth--unlocked t)
+        (lispm-auth--data-key (make-string 64 ?a))
+        (lispm-auth--last-use (time-subtract (current-time) (seconds-to-time 600)))
+        (lispm-auth--lock-timer nil)
+        (lispm-auth--auto-lock-notify-timer nil)
+        (lispm-auth-auto-lock 5)
+        (lock-fired 0)
+        (auto-lock-fired 0))
+    (unwind-protect
+        (let ((lispm-auth-lock-hook (list (lambda () (setq lock-fired (1+ lock-fired)))))
+              (lispm-auth-auto-lock-hook (list (lambda () (setq auto-lock-fired (1+ auto-lock-fired))))))
+          (lispm-auth--lock-if-stale)
+          (should (lispm-auth-locked-p))
+          (should-not lispm-auth--data-key)
+          (should (= lock-fired 1))
+          ;; Deferred until event loop / timer tick so callers inside redisplay stay safe.
+          (should (= auto-lock-fired 0))
+          (should (timerp lispm-auth--auto-lock-notify-timer))
+          (sleep-for 0.05)
+          (should (= auto-lock-fired 1))
+          (should-not lispm-auth--auto-lock-notify-timer)
+          ;; Unlocking before the notify timer runs suppresses the stale lock notification.
+          (setq lispm-auth--unlocked t
+                lispm-auth--data-key (make-string 64 ?b)
+                lispm-auth--last-use (time-subtract (current-time) (seconds-to-time 600)))
+          (lispm-auth--lock-if-stale)
+          (should (timerp lispm-auth--auto-lock-notify-timer))
+          (setq lispm-auth--unlocked t
+                lispm-auth--data-key (make-string 64 ?c))
+          (lispm-auth--touch)
+          (should-not lispm-auth--auto-lock-notify-timer)
+          (sleep-for 0.05)
+          (should (= auto-lock-fired 1)))
+      (lispm-auth-lock)
+      (lispm-auth--cancel-auto-lock-notify-timer))))
+
+(ert-deftest lispm-auth-test-secret-available-caches-verified-service ()
+  "Availability probes cache a verified service executable until invalidated."
+  (lispm-auth-test--with-service
+    (let ((lispm-auth--service-verified nil)
+          (probes 0)
+          (orig-new-key (symbol-function 'lispm-auth--new-data-key)))
+      (cl-letf (((symbol-function 'lispm-auth--new-data-key)
+                 (lambda ()
+                   (setq probes (1+ probes))
+                   (funcall orig-new-key))))
+        (should (lispm-auth--secret-available))
+        (should (lispm-auth--secret-available))
+        (should (lispm-auth--secret-available))
+        (should (= probes 1))
+        (setq lispm-auth--service-verified nil)
+        (should (lispm-auth--secret-available))
+        (should (= probes 2))))))
 
 (ert-deftest lispm-auth-test-first-password-is-setup-operation ()
   (let ((lispm-auth-password-function

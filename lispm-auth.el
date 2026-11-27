@@ -4,7 +4,7 @@
 
 ;; Author: Ryan.K
 ;; URL: https://github.com/LispMachineLab/lispm-auth
-;; Version: 0.2.9
+;; Version: 0.2.10
 ;; Package-Requires: ((emacs "30.1"))
 ;; Keywords: tools, data
 ;; SPDX-License-Identifier: AGPL-3.0-or-later
@@ -41,10 +41,12 @@
 ;;
 ;; LispM itself keeps no store: its core says how a backend names a
 ;; secret, `:key (secret . ID)', and calls the functions here through
-;; the hooks it documents, `lispm-secret-get-functions' and the three
-;; beside it.  Loading this file adds them.
+;; the hooks it documents, `lispm-secret-get-functions',
+;; `lispm-secret-exists-functions' and the others beside it.  Loading
+;; this file adds them.
 ;;
 ;;   (lispm-secret-get ID &optional NO-PROMPT)   a key, or nil
+;;   (lispm-secret-exists-p ID)                  whether a key exists, without decrypting
 ;;   (lispm-secret-set ID SECRET)                keep a key
 ;;   (lispm-secret-delete ID)                    forget a key
 ;;   (lispm-secret-available-p)                  whether this store is here
@@ -445,6 +447,9 @@ key.  nil while the store is locked, and no secret is read then.")
 (defvar lispm-auth--lock-timer nil
   "The timer that locks the store when it is not used in time, or nil.")
 
+(defvar lispm-auth--auto-lock-notify-timer nil
+  "Pending idle-tick timer running `lispm-auth-auto-lock-hook', or nil.")
+
 (defvar lispm-auth--migrated nil
   "Non-nil once backends' literal keys were moved into the store this session.")
 
@@ -463,6 +468,19 @@ key.  nil while the store is locked, and no secret is read then.")
   (when (timerp lispm-auth--lock-timer)
     (cancel-timer lispm-auth--lock-timer))
   (setq lispm-auth--lock-timer nil))
+
+(defun lispm-auth--cancel-auto-lock-notify-timer ()
+  "Cancel any pending deferred auto-lock notification timer."
+  (when (timerp lispm-auth--auto-lock-notify-timer)
+    (cancel-timer lispm-auth--auto-lock-notify-timer))
+  (setq lispm-auth--auto-lock-notify-timer nil))
+
+(defun lispm-auth--notify-auto-lock ()
+  "Notify auto-lock hooks on an event-loop turn if still locked."
+  (setq lispm-auth--auto-lock-notify-timer nil)
+  (when (lispm-auth-locked-p)
+    (message "LispM Auth: the store is locked again")
+    (run-hooks 'lispm-auth-auto-lock-hook)))
 
 (defun lispm-auth--arm-lock-timer ()
   "Set the timer that locks the store when it is not used in time."
@@ -510,13 +528,19 @@ key.  nil while the store is locked, and no secret is read then.")
 (defun lispm-auth--touch ()
   "Note that the store was used, and begin its time again."
   (when lispm-auth--unlocked
+    (lispm-auth--cancel-auto-lock-notify-timer)
     (setq lispm-auth--last-use (current-time))
     (lispm-auth--arm-lock-timer)))
 
 (defun lispm-auth--lock-if-stale ()
   "Lock the store when its time ran out while Emacs was busy or asleep."
   (when (and lispm-auth--unlocked (lispm-auth--expired-p))
-    (lispm-auth-lock)))
+    (lispm-auth-lock)
+    ;; Defer hooks to a 0s timer so callers inside `redisplay_internal'
+    ;; (such as mode-line evaluators) never launch a modal lock screen reentrantly.
+    (unless (timerp lispm-auth--auto-lock-notify-timer)
+      (setq lispm-auth--auto-lock-notify-timer
+            (run-at-time 0 nil #'lispm-auth--notify-auto-lock)))))
 
 (defun lispm-auth-locked-p ()
   "Return non-nil when the store is locked."
@@ -528,6 +552,7 @@ The store's files are not touched; the next use asks for the password."
   (interactive)
   (let ((was-unlocked lispm-auth--unlocked))
     (lispm-auth--cancel-lock-timer)
+    (lispm-auth--cancel-auto-lock-notify-timer)
     (when (stringp lispm-auth--data-key)
       ;; A best effort: Lisp strings are not promised to be wiped.
       (ignore-errors (clear-string lispm-auth--data-key)))
@@ -1866,6 +1891,13 @@ This is separate from the encrypted store.  Loading LispM Auth never downloads."
               '("Install the standalone service artifact or set lispm-auth-service-program to an absolute executable path")))
     program))
 
+(defvar lispm-auth--service-verified nil
+  "Cached `(PROGRAM . MTIME)' for a verified crypto service executable.")
+
+(defun lispm-auth--service-cache-key (program)
+  "Return cache key `(PROGRAM . MTIME)' for crypto service PROGRAM."
+  (cons program (file-attribute-modification-time (file-attributes program))))
+
 (defun lispm-auth--tar-number (text)
   "Read an unsigned octal USTAR numeric field TEXT, rejecting extensions."
   (let ((number (string-trim text "[ \0]+" "[ \0]+")))
@@ -1982,6 +2014,7 @@ An existing installation is never overwritten."
               (unless (string-match-p "\\`[0-9a-f]\\{64\\}\\'" probe)
                 (signal 'lispm-auth-error '("Installed service failed its probe"))))
             (rename-file staging (directory-file-name destination))
+            (setq lispm-auth--service-verified nil)
             (message "LispM Auth service installed: %s" destination)
             destination)
         (delete-file temporary)
@@ -2006,6 +2039,7 @@ Return its hexadecimal result.  Never retain or display its stderr."
          (output "") (overflow nil) (process nil) (stderr-process nil))
     (unwind-protect
         (with-timeout (lispm-auth-service-timeout
+                       (setq lispm-auth--service-verified nil)
                        (signal 'lispm-auth-unavailable '("Crypto service timed out")))
           (condition-case nil
               (progn
@@ -2033,6 +2067,7 @@ Return its hexadecimal result.  Never retain or display its stderr."
                 (while (and (not overflow) (accept-process-output process 0.01)))
                 (unless (and (not overflow) (eq (process-status process) 'exit)
                              (= (process-exit-status process) 0))
+                  (setq lispm-auth--service-verified nil)
                   (signal 'lispm-auth-unavailable '("Crypto service failed")))
                 (cond ((equal output "error\tauth\n")
                        (signal 'lispm-auth-service-auth-error nil))
@@ -2041,8 +2076,12 @@ Return its hexadecimal result.  Never retain or display its stderr."
                       ((and (string-match "\\`ok\t\\([0-9a-f]*\\)\n\\'" output)
                             (zerop (% (length (match-string 1 output)) 2)))
                        (match-string 1 output))
-                      (t (signal 'lispm-auth-unavailable '("Invalid crypto service response")))))
-            (file-error (signal 'lispm-auth-unavailable '("Crypto service could not start")))))
+                      (t
+                       (setq lispm-auth--service-verified nil)
+                       (signal 'lispm-auth-unavailable '("Invalid crypto service response")))))
+            (file-error
+             (setq lispm-auth--service-verified nil)
+             (signal 'lispm-auth-unavailable '("Crypto service could not start")))))
       (let ((inhibit-quit t))
         (when (processp process) (delete-process process))
         (when (processp stderr-process) (delete-process stderr-process))
@@ -2151,12 +2190,22 @@ place is not read as the secret asked for."
           (error "LispM Auth: invalid secret"))
         (cdr pair)))))
 
-(defun lispm-auth--get (id)
-  "Return the secret ID the open store keeps, or nil."
+(defun lispm-auth--get (id &optional no-touch)
+  "Return the secret ID the open store keeps, or nil.
+When NO-TOUCH is non-nil, do not refresh the auto-lock idle timer."
   (when lispm-auth--unlocked
     (let ((secret (lispm-auth--read-item id)))
-      (lispm-auth--touch)
+      (unless no-touch
+        (lispm-auth--touch))
       secret)))
+
+(defun lispm-auth-has-secret-p (id)
+  "Return non-nil when the open store holds an encrypted secret for ID.
+Checks without decrypting the ciphertext or extending the auto-lock timer."
+  (lispm-auth--lock-if-stale)
+  (and lispm-auth--unlocked
+       (file-regular-p (lispm-auth--item-file id))
+       t))
 
 (defun lispm-auth--set (id secret)
   "Keep SECRET as ID in the open store; return non-nil when stored."
@@ -2516,15 +2565,19 @@ See `lispm-auth-start-apps'."
 
 (defun lispm-auth--secret-get (id no-prompt)
   "Return the secret ID, as `lispm-secret-get-functions' asks.
-NO-PROMPT non-nil asks for no password: answer nil while locked, and
-touch none of the encrypted data."
+NO-PROMPT non-nil asks for no password: answer nil while locked,
+touch none of the encrypted data, and keep the auto-lock timer as it is."
   (lispm-auth--lock-if-stale)
   (cond
-   (lispm-auth--unlocked (lispm-auth--get id))
+   (lispm-auth--unlocked (lispm-auth--get id no-prompt))
    (no-prompt nil)
    ((not (lispm-auth-store-exists-p)) nil)
    (t (when (lispm-auth--ensure-open)
         (lispm-auth--get id)))))
+
+(defun lispm-auth--secret-exists (id)
+  "Return non-nil when encrypted secret ID exists in the open store."
+  (lispm-auth-has-secret-p id))
 
 (defun lispm-auth--secret-set (id secret)
   "Keep SECRET as ID, as `lispm-secret-set-functions' asks.
@@ -2546,9 +2599,17 @@ Return non-nil when it was there."
 (defun lispm-auth--secret-available ()
   "Return non-nil when LispM Auth can keep secrets here.
 That is: the Common Lisp crypto service can run."
-  (condition-case nil (progn (lispm-auth--new-data-key) t) (error nil)))
+  (condition-case nil
+      (let* ((program (lispm-auth--service-program))
+             (key (lispm-auth--service-cache-key program)))
+        (unless (equal lispm-auth--service-verified key)
+          (lispm-auth--new-data-key)
+          (setq lispm-auth--service-verified key))
+        t)
+    (error nil)))
 
 (add-hook 'lispm-secret-get-functions #'lispm-auth--secret-get)
+(add-hook 'lispm-secret-exists-functions #'lispm-auth--secret-exists)
 (add-hook 'lispm-secret-set-functions #'lispm-auth--secret-set)
 (add-hook 'lispm-secret-delete-functions #'lispm-auth--secret-delete)
 (add-hook 'lispm-secret-available-functions #'lispm-auth--secret-available)
